@@ -1,0 +1,14 @@
+{
+  "name": "eco-fen-bot",
+  "version": "1.0.0",
+  "main": "eco_fen_bot.js",
+  "scripts": {
+    "start": "node eco_fen_bot.js --serve"
+  },
+  "dependencies": {
+    "axios": "^1.x",
+    "chess.js": "^1.x",
+    "express": "^4.x",
+    "minimist": "^1.x"
+  }
+}
