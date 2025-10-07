@@ -39,6 +39,7 @@ const path = require('path');
 const express = require('express');
 const axios = require('axios');
 const { Chess } = require('chess.js');
+const cors = require('cors');
 
 // -------------------------
 // Configuration via ENV
@@ -631,6 +632,9 @@ async function postResultToServer(callbackUrl, payload, timeout) {
 function createApp() {
   const app = express();
   app.use(express.json({ limit: '1mb' }));
+
+  app.use(cors());          // allow all origins (dev). Replace with options to restrict if you want.
+app.options('*', cors()); // respond to preflight
 
   app.get('/health', (req, res) => res.json({ ok: true }));
 
