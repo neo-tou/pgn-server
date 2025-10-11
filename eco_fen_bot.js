@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 /*
-  eco_fen_bot.js - rewritten with "walk-up" hierarchical path and orderless matching.
+  eco_fen_bot.js - rewritten with "walk-up" hierarchical path and orderless matching,
+  plus per-ply progressive opening summary.
 
   Usage / notes: same as original. New POST /analyze options:
-    - orderless_matching: boolean (default false)  -- report & optionally prefer set-matches
-    - orderless_threshold: number between 0 and 1 (default 1.0) -- fraction of tokens required for set-match
+    - orderless_matching: boolean (default false)
+    - orderless_threshold: number between 0 and 1 (default 1.0)
+    - prefer_set_matches: boolean (default false)
 
   Dependencies: express, axios, chess.js, cors, minimist
   Install: npm i express axios chess.js cors minimist
@@ -61,15 +63,33 @@ function normalizeMoveNumbersLine(s) {
   return s;
 }
 
+// Robust PGN moves tokenizer: strips tag-pair header lines and then extracts moves.
+// This fixes PGNs without blank line after headers.
 function tokenizePgnMoves(pgnText) {
   let text = pgnText || '';
   if (!text) return [];
-  let movesPart = text;
-  if (text.indexOf('\n\n') !== -1) {
-    movesPart = text.split('\n\n')[1];
+
+  // Normalize line endings and split into lines
+  const lines = text.replace(/\r/g, '').split('\n');
+
+  // Remove tag-pair header lines like: [Event "Foo"] and blank lines at top
+  const bodyLines = [];
+  for (const line of lines) {
+    if (/^\s*\[.*\]\s*$/.test(line)) continue; // skip tag-pair header
+    bodyLines.push(line);
   }
-  movesPart = movesPart.replace(/\r/g, ' ').replace(/\n/g, ' ').trim();
+
+  // Join remaining lines into a single moves string
+  let movesPart = bodyLines.join(' ').trim();
+
+  // Fallback: if nothing left and original contains a blank-line separator, keep old behaviour
+  if (!movesPart && text.indexOf('\n\n') !== -1) {
+    movesPart = text.split('\n\n')[1] || '';
+  }
+
+  movesPart = movesPart.replace(/\s+/g, ' ').trim();
   if (!movesPart) return [];
+
   const rawTokens = movesPart.split(/\s+/);
   const tokens = [];
   let i = 0;
@@ -236,7 +256,6 @@ function loadOpeningsFromEco(filename) {
   const openings = [];
   const fenIndex = new Map(); // Map<canonFen, Array<{ent, ply}>>
 
-
   function addToIndex(canon, ent, ply) {
     if (!canon) return;
     const arr = fenIndex.get(canon) || [];
@@ -396,7 +415,55 @@ function bestEntryForFen(canon, playedTokensAtPly, fullPlayedTokens, options = {
 }
 
 // -------------------------
-// Sequence fallback analyzer
+// Sequence fallback helper (for per-ply sequence-only matching)
+// -------------------------
+function bestSequenceMatchForTokens(seqTokens) {
+  // seqTokens: array like ['e4'] or ['e4','e5','Nf3', ...]
+  if (!Array.isArray(seqTokens) || seqTokens.length === 0) return null;
+
+  const candidates = [];
+  for (const ent of OPENINGS) {
+    if (!ent._moves_norm) continue;
+    const entTokens = movesTokensFromNorm(ent._moves_norm || '');
+    if (!entTokens || entTokens.length === 0) continue;
+    // check whether seqTokens is a prefix of entTokens
+    if (entTokens.length < seqTokens.length) continue;
+    let ok = true;
+    for (let i = 0; i < seqTokens.length; i++) {
+      if (entTokens[i] !== seqTokens[i]) { ok = false; break; }
+    }
+    if (ok) candidates.push(ent);
+  }
+
+  if (candidates.length === 0) return null;
+
+  // pick best raw as in analyzeBySequence (specificity + count)
+  const rawCounts = new Map();
+  const rawToEntries = new Map();
+  for (const ent of candidates) {
+    const raw = (ent.name || ent.opening || ent._key || '').toString().trim();
+    rawCounts.set(raw, (rawCounts.get(raw) || 0) + 1);
+    const arr = rawToEntries.get(raw) || [];
+    arr.push(ent);
+    rawToEntries.set(raw, arr);
+  }
+  function rawKey(r) {
+    return [specificityScore(r), rawCounts.get(r) || 0];
+  }
+  let bestRaw = null;
+  for (const r of rawCounts.keys()) {
+    if (!bestRaw) bestRaw = r;
+    else {
+      const a = rawKey(bestRaw), b = rawKey(r);
+      if (b[0] > a[0] || (b[0] === a[0] && b[1] > a[1])) bestRaw = r;
+    }
+  }
+  const exampleEnt = (rawToEntries.get(bestRaw) || [candidates[0]])[0];
+  return exampleEnt || null;
+}
+
+// -------------------------
+// Sequence fallback analyzer (original)
 // -------------------------
 function analyzeBySequence(pgnText, maxPlies) {
   const max_plies = (typeof maxPlies === 'number') ? maxPlies : DEFAULT_MAX_PLIES;
@@ -464,7 +531,7 @@ function analyzeBySequence(pgnText, maxPlies) {
 }
 
 // -------------------------
-// FEN-based analyzer with walk-up, per_level, orderless matching
+// FEN-based analyzer with walk-up, per_level, orderless matching, and per-ply summary
 // -------------------------
 function analyzeByFen(pgnText, maxPlies, requireFenOnly = false, debug = false, opts = {}) {
   // opts: { orderless_matching: bool, orderless_threshold: number, prefer_set_matches: bool }
@@ -506,6 +573,21 @@ function analyzeByFen(pgnText, maxPlies, requireFenOnly = false, debug = false, 
     pliesDone = plyIndex + 1;
   }
 
+  // fallback early if no FENs parsed (tokenizer or malformed PGN)
+  if (fenPerPly.length === 0) {
+    if (requireFenOnly) {
+      const out = { opening_path: [], opening: null, book_moves: [], matched_fen: null, plies_analyzed: 0, max_plies: max_plies, error: 'no_fens_parsed' };
+      if (debug) out.debug = { fen_per_ply: fenPerPly };
+      return out;
+    } else {
+      // return sequence fallback (full-game)
+      const seq = analyzeBySequence(pgnText, max_plies);
+      seq.matched_fen = null;
+      if (debug) seq.debug = { fen_per_ply: fenPerPly, note: 'no_fens_parsed' };
+      return seq;
+    }
+  }
+
   function commonPrefixLen(a, b) {
     const n = Math.min(a.length, b.length);
     for (let i = 0; i < n; i++) if (a[i] !== b[i]) return i;
@@ -515,7 +597,68 @@ function analyzeByFen(pgnText, maxPlies, requireFenOnly = false, debug = false, 
   // prepare whole-game tokens array for orderless set checks
   const wholeGameTokens = fenPerPly.map(r => r.san).filter(Boolean);
 
-  // search from deepest ply -> shallowest
+  // Build per-ply summary (progressive mapping)
+  const per_ply = [];
+  const ply_progression = []; // human-readable strings
+
+  for (let i = 0; i < fenPerPly.length; i++) {
+    const rec = fenPerPly[i];
+    const ply = rec.ply;
+    const seqTokensAtPly = rec.played_tokens || [];
+    const seqStr = buildSequenceString(seqTokensAtPly);
+    let chosenName = null;
+    let chosenEco = null;
+    let chosenPath = [];
+    let chosen_raw = null;
+
+    // Try FEN-based exact or best match first
+    const bestByFen = bestEntryForFen(rec.fen, seqTokensAtPly, wholeGameTokens, {
+      preferSetMatch: !!opts.prefer_set_matches,
+      setThreshold: (typeof opts.orderless_threshold === 'number') ? opts.orderless_threshold : 1.0
+    });
+
+    if (bestByFen && bestByFen.ent) {
+      chosen_raw = bestByFen.rawName;
+      chosenEco = bestByFen.ent.eco || null;
+      chosenPath = buildOpeningPathFromRaw(chosen_raw, tokens[0] || null);
+      chosenName = chosenPath[0] || (bestByFen.ent.name || bestByFen.ent.opening || bestByFen.ent._key);
+    } else {
+      // Fallback to sequence-only matching for this ply
+      const seqMatchEnt = bestSequenceMatchForTokens(seqTokensAtPly);
+      if (seqMatchEnt) {
+        chosen_raw = (seqMatchEnt.name || seqMatchEnt.opening || seqMatchEnt._key || '').toString().trim();
+        chosenEco = seqMatchEnt.eco || null;
+        chosenPath = buildOpeningPathFromRaw(chosen_raw, tokens[0] || null);
+        chosenName = chosenPath[0] || seqMatchEnt.name || seqMatchEnt.opening || seqMatchEnt._key;
+      } else {
+        // Last resort: use POPULAR_FIRST_MOVES for single first ply white move
+        if (seqTokensAtPly.length === 1) {
+          const first = (seqTokensAtPly[0] || '').toLowerCase();
+          const list = POPULAR_FIRST_MOVES[first];
+          if (list && list.length) {
+            chosenName = list[0];
+            chosenPath = [chosenName];
+          }
+        }
+      }
+    }
+
+    per_ply.push({
+      ply,
+      sequence: seqStr,
+      sequence_tokens: seqTokensAtPly.slice(),
+      opening: chosenName,
+      eco: chosenEco,
+      opening_path: chosenPath,
+      matched_fen: rec.fen
+    });
+
+    // human-readable
+    const human = `${seqStr} → ${chosenName || 'unknown'}` + (chosenEco ? ` (${chosenEco})` : '');
+    ply_progression.push(human);
+  }
+
+  // search from deepest ply -> shallowest for the primary "matched opening" using your walk-up logic
   let bestOut = null;
   for (let ri = fenPerPly.length - 1; ri >= 0; ri--) {
     const record = fenPerPly[ri];
@@ -527,7 +670,6 @@ function analyzeByFen(pgnText, maxPlies, requireFenOnly = false, debug = false, 
     const candRefs = FEN_TO_ENTRIES.get(canon) || [];
     if (!candRefs || candRefs.length === 0) continue;
 
-    // compute scored list via bestEntryForFen but we want to consider orderless options
     const entryChoice = bestEntryForFen(canon, playedTokensAtPly, wholeGameTokens, {
       preferSetMatch: !!opts.prefer_set_matches,
       setThreshold: (typeof opts.orderless_threshold === 'number') ? opts.orderless_threshold : 1.0
@@ -610,7 +752,9 @@ function analyzeByFen(pgnText, maxPlies, requireFenOnly = false, debug = false, 
       matched_fen: canon,
       plies_analyzed: matchedPly,
       max_plies: max_plies,
-      per_level: per_level
+      per_level: per_level,
+      per_ply: per_ply,
+      ply_progression: ply_progression
     };
 
     if (debug) {
@@ -621,83 +765,18 @@ function analyzeByFen(pgnText, maxPlies, requireFenOnly = false, debug = false, 
     return out;
   }
 
-  // No FEN-based match found
+  // No FEN-based top-level match found: fallback to sequence analyzer but keep per-ply progression
   if (requireFenOnly) {
-    const out = { opening_path: [], opening: null, book_moves: [], matched_fen: null, plies_analyzed: pliesDone, max_plies: max_plies, error: 'no_fen_match' };
+    const out = { opening_path: [], opening: null, book_moves: [], matched_fen: null, plies_analyzed: pliesDone, max_plies: max_plies, error: 'no_fen_match', per_ply: per_ply, ply_progression: ply_progression };
     if (debug) out.debug = { fen_per_ply: fenPerPly };
     return out;
   }
 
   const seq = analyzeBySequence(pgnText, max_plies);
   seq.matched_fen = null;
+  seq.per_ply = per_ply;
+  seq.ply_progression = ply_progression;
   if (debug) seq.debug = { fen_per_ply: fenPerPly };
-
-  // London detection heuristic (applied on fallback sequence result)
-  function detectLondonFromTokens(tokensList, lookaheadPlies = 16) {
-    const bf4Re = /^([Bb].{0,2}f4|Bf4)\b/i;
-    const c4Re = /^(c4|cxd4|cxd5)\b/i;
-    const e3Re = /^e3\b/i;
-    const c3Re = /^c3\b/i;
-    const details = { found_bf4_ply: null, had_c4_before: false, had_e3_before: false, had_c3_before: false };
-    const maxIndex = Math.min(tokensList.length, lookaheadPlies);
-    for (let i = 0; i < maxIndex; i++) {
-      const tok = tokensList[i];
-      if (i % 2 === 0) {
-        if (bf4Re.test(tok)) {
-          details.found_bf4_ply = i + 1;
-          for (let j = 0; j < i; j++) {
-            if (j % 2 === 0) {
-              if (c4Re.test(tokensList[j])) details.had_c4_before = true;
-              if (e3Re.test(tokensList[j])) details.had_e3_before = true;
-              if (c3Re.test(tokensList[j])) details.had_c3_before = true;
-            }
-          }
-          break;
-        }
-      }
-    }
-    let isLondon = false;
-    if (details.found_bf4_ply !== null && !details.had_c4_before) {
-      if (details.had_e3_before || details.had_c3_before) isLondon = true;
-      else if (details.found_bf4_ply <= 6) isLondon = true;
-    }
-    return { is_london: isLondon, details };
-  }
-
-  const londonCheck = detectLondonFromTokens(tokens, 16);
-  if (londonCheck.is_london) {
-    const londonCandidates = [];
-    for (const e of OPENINGS) {
-      const nm = ((e.name || e.opening || '') + '').toLowerCase();
-      if (nm.includes('london')) {
-        for (const f of fenPerPly) {
-          if (e._fen_to_ply && e._fen_to_ply[f.fen] != null) londonCandidates.push([e, f.ply]);
-        }
-      }
-    }
-    if (londonCandidates.length > 0) {
-      londonCandidates.sort((a, b) => (a[1] || 9999) - (b[1] || 9999));
-      const chosen = londonCandidates[0][0];
-      const matchedPly = londonCandidates[0][1];
-      const rawName = ((chosen.name || chosen.opening || chosen._key) || '').toString().trim();
-      const openingPath = buildOpeningPathFromRaw(rawName, tokens[0] || null);
-      const out = { opening_path: openingPath, opening: { eco: chosen.eco, name: openingPath[0] || null }, book_moves: chosen._moves_norm || [], matched_fen: chosen._fen || null, plies_analyzed: matchedPly || pliesDone, max_plies: max_plies };
-      if (debug) out.debug = { fen_per_ply: fenPerPly, london_details: londonCheck.details };
-      return out;
-    }
-
-    // otherwise synthesize London on top of fallback seq result
-    const synthPath = ['London System'];
-    if (seq.opening_path) {
-      for (const p of seq.opening_path) if (!synthPath.includes(p)) synthPath.push(p);
-    }
-    seq.opening_path = synthPath;
-    seq.opening = { eco: (seq.opening && seq.opening.eco), name: synthPath[0] };
-    seq.matched_fen = null;
-    if (debug) seq.debug = { fen_per_ply: fenPerPly, london_details: londonCheck.details };
-    return seq;
-  }
-
   return seq;
 }
 
