@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 /*
-  eco_fen_bot.js - rewritten with "walk-up" hierarchical path and orderless matching,
-  plus per-ply progressive opening summary. Now builds parent->...->specific opening_path
-  that follows the PGN moves.
+  eco_fen_bot_move_by_move.js
+  Analyze PGN move-by-move (half-move by half-move) and report parent opening for each cumulative sequence
+  up to the first N plies (default 10).
+
+  Dependencies: express, axios, chess.js, cors, minimist
+  Install: npm i express axios chess.js cors minimist
 */
 
 const fs = require('fs');
@@ -17,6 +20,7 @@ const cors = require('cors');
 // -------------------------
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const DEFAULT_MAX_PLIES = parseInt(process.env.DEFAULT_MAX_PLIES || '9999', 10);
+const MAX_PLIES_TO_REPORT = parseInt(process.env.MAX_PLIES_TO_REPORT || '10', 10); // how many plies to return for summary
 const POST_TIMEOUT = parseFloat(process.env.POST_TIMEOUT || '8');
 const POLL_URL = process.env.POLL_URL || '';
 const POLL_INTERVAL = parseFloat(process.env.POLL_INTERVAL || '5');
@@ -56,29 +60,19 @@ function normalizeMoveNumbersLine(s) {
   return s;
 }
 
-// Robust PGN moves tokenizer: strips tag-pair header lines and then extracts moves.
+// Robust PGN tokenizer (ignores headers, comments, variations, outcomes)
 function tokenizePgnMoves(pgnText) {
   let text = pgnText || '';
   if (!text) return [];
 
-  // Normalize line endings and split into lines
   const lines = text.replace(/\r/g, '').split('\n');
-
-  // Remove tag-pair header lines like: [Event "Foo"] and blank lines at top
   const bodyLines = [];
   for (const line of lines) {
-    if (/^\s*\[.*\]\s*$/.test(line)) continue; // skip tag-pair header
+    if (/^\s*\[.*\]\s*$/.test(line)) continue; // tag pair header
     bodyLines.push(line);
   }
-
-  // Join remaining lines into a single moves string
   let movesPart = bodyLines.join(' ').trim();
-
-  // Fallback: if nothing left and original contains a blank-line separator, keep old behaviour
-  if (!movesPart && text.indexOf('\n\n') !== -1) {
-    movesPart = text.split('\n\n')[1] || '';
-  }
-
+  if (!movesPart && text.indexOf('\n\n') !== -1) movesPart = text.split('\n\n')[1] || '';
   movesPart = movesPart.replace(/\s+/g, ' ').trim();
   if (!movesPart) return [];
 
@@ -88,27 +82,20 @@ function tokenizePgnMoves(pgnText) {
   while (i < rawTokens.length) {
     let t = rawTokens[i];
     if (!t) { i++; continue; }
-    // skip comments {...}
     if (t.startsWith('{')) {
       while (i < rawTokens.length && !rawTokens[i].includes('}')) i++;
-      i++;
-      continue;
+      i++; continue;
     }
-    // skip variations (... )
     if (t.startsWith('(')) {
       while (i < rawTokens.length && !rawTokens[i].includes(')')) i++;
-      i++;
-      continue;
+      i++; continue;
     }
-    // skip outcomes
-    if (['1-0', '0-1', '1/2-1/2', '*'].includes(t)) { i++; continue; }
-    // strip move numbers like "1." or "1..."
+    if (['1-0','0-1','1/2-1/2','*'].includes(t)) { i++; continue; }
     let cleaned = t.replace(/^\d+\.{1,3}/, '');
     if (cleaned === '') {
       i++;
       if (i < rawTokens.length) {
-        const nextTok = rawTokens[i];
-        cleaned = nextTok.replace(/^\d+\.{1,3}/, '');
+        cleaned = rawTokens[i].replace(/^\d+\.{1,3}/, '');
       } else break;
     }
     cleaned = cleaned.trim();
@@ -129,8 +116,7 @@ function buildSequenceString(seqTokens) {
       parts.push(tok);
     }
   }
-  const seq = parts.join(' ');
-  return normalizeMoveNumbersLine(seq);
+  return normalizeMoveNumbersLine(parts.join(' '));
 }
 
 function specificityScore(name) {
@@ -140,6 +126,7 @@ function specificityScore(name) {
   return colonCount * 50 + commaCount * 5 + name.length;
 }
 
+// derive path fragments from raw entry name (same as yours)
 function buildOpeningPathFromRaw(rawName, firstToken) {
   if (rawName === undefined || rawName === null) rawName = String(rawName || '');
   let s = rawName.trim();
@@ -191,8 +178,6 @@ function canonicalizeFenString(fen) {
   if (!fen || typeof fen !== 'string') return null;
   fen = fen.trim();
   try {
-    const c = new Chess(fen);
-    if (!fen.split(' ')[0]) return null;
     return canonicalFenFromChessInstance(new Chess(fen));
   } catch (e) {
     const parts = fen.split(' ');
@@ -215,11 +200,8 @@ function computeFensFromMovesString(moves) {
     if (!ok) {
       const uciMatch = tok.match(/^([a-h][1-8])([a-h][1-8])([qrbn])?$/i);
       if (uciMatch) {
-        const from = uciMatch[1];
-        const to = uciMatch[2];
-        const prom = uciMatch[3];
-        const moveObj = { from: from.toLowerCase(), to: to.toLowerCase() };
-        if (prom) moveObj.promotion = prom.toLowerCase();
+        const moveObj = { from: uciMatch[1].toLowerCase(), to: uciMatch[2].toLowerCase() };
+        if (uciMatch[3]) moveObj.promotion = uciMatch[3].toLowerCase();
         try {
           const mv2 = board.move(moveObj);
           if (mv2) ok = true;
@@ -247,7 +229,6 @@ function loadOpeningsFromEco(filename) {
 
   const openings = [];
   const fenIndex = new Map(); // Map<canonFen, Array<{ent, ply}>>
-
 
   function addToIndex(canon, ent, ply) {
     if (!canon) return;
@@ -282,7 +263,7 @@ function loadOpeningsFromEco(filename) {
 
   for (const ent of openings) {
     if (ent._fen) addToIndex(ent._fen, ent, null);
-    for (const [fen, ply] of Object.entries(ent._fen_to_ply || {})) addToIndex(fen, ent, ply);
+    for (const [fen, ply] of Object.entries(ent._fen_to_ply || {})) addToIndex(fen, ent, parseInt(ply, 10));
   }
 
   logInfo(`Loaded ${openings.length} ECO entries; ${fenIndex.size} distinct canonical FEN keys`);
@@ -292,7 +273,7 @@ function loadOpeningsFromEco(filename) {
 const { openings: OPENINGS, fenIndex: FEN_TO_ENTRIES } = loadOpeningsFromEco(ECO_FILENAME);
 
 // -------------------------
-// Token helpers
+// Token helpers & matching helpers
 // -------------------------
 function movesTokensFromNorm(movesNorm) {
   if (!movesNorm) return [];
@@ -306,9 +287,6 @@ function isTokenPrefix(prefix, full) {
   return true;
 }
 
-// -------------------------
-// New helpers for orderless matching and "which moves led to entry"
-// -------------------------
 function entryMatchesBySetFraction(entTokens, playedTokens, thresholdFraction) {
   if (!Array.isArray(entTokens) || entTokens.length === 0) return false;
   if (!Array.isArray(playedTokens) || playedTokens.length === 0) return false;
@@ -325,7 +303,7 @@ function findMatchedTokensPositions(entTokens, playedTokens) {
   for (let i = 0; i < playedTokens.length; i++) {
     const t = playedTokens[i];
     const arr = lookup.get(t) || [];
-    arr.push(i + 1); // 1-based token index
+    arr.push(i + 1);
     lookup.set(t, arr);
   }
   for (const tok of entTokens) {
@@ -335,17 +313,8 @@ function findMatchedTokensPositions(entTokens, playedTokens) {
   return out;
 }
 
-function movesForPly(fenPerPly, ply) {
-  if (!Array.isArray(fenPerPly) || fenPerPly.length === 0) return [];
-  if (!ply || ply < 1) return [];
-  const rec = fenPerPly[ply - 1];
-  if (!rec) return [];
-  return rec.played_tokens ? rec.played_tokens.slice() : [];
-}
-
-// ---------- helper: best entry selection for a canonical FEN ----------
+// pick best entry for a FEN (keeps original scoring behavior)
 function bestEntryForFen(canon, playedTokensAtPly, fullPlayedTokens, options = {}) {
-  // options: { preferSetMatch: boolean, setThreshold: 1.0 }
   const candRefs = FEN_TO_ENTRIES.get(canon) || [];
   if (!candRefs || candRefs.length === 0) return null;
   const playedLen = (playedTokensAtPly && playedTokensAtPly.length) || 0;
@@ -353,12 +322,11 @@ function bestEntryForFen(canon, playedTokensAtPly, fullPlayedTokens, options = {
 
   for (const ref of candRefs) {
     const ent = ref.ent;
-    const entPly = ref.ply;
     const rawName = ((ent.name || ent.opening || ent._key) || '').toString().trim();
     const entMovesNorm = ent._moves_norm || '';
     const entTokens = movesTokensFromNorm(entMovesNorm);
 
-    // prefix check vs played tokens at this ply
+    // require sequence prefix match to respect ordering
     const minLen = Math.min(entTokens.length, playedLen);
     let mismatch = false;
     if (minLen > 0) {
@@ -377,20 +345,18 @@ function bestEntryForFen(canon, playedTokensAtPly, fullPlayedTokens, options = {
     const movesLen = entTokens.length;
     const spec = specificityScore(rawName);
 
-    // orderless/set-match metric
+    // set-match
     const setThreshold = (options && typeof options.setThreshold === 'number') ? options.setThreshold : 1.0;
     const setMatched = entryMatchesBySetFraction(entTokens, fullPlayedTokens || [], setThreshold) ? 1 : 0;
 
-    // build scoring key; prefer longer common prefix earlier to favor human-expected path
     let key;
     if (options && options.preferSetMatch) {
       key = [setMatched, samePly, commonLen, entryFullyMatchedByPlay, reachesCanon, -movesLen, spec];
     } else {
-      // NOTE: commonLen moved earlier vs your original; this biases toward entries that share longer prefix
       key = [samePly, commonLen, entryFullyMatchedByPlay, reachesCanon, -movesLen, spec, setMatched];
     }
 
-    scored.push({ key, ent, entPly, rawName, entTokens, setMatched });
+    scored.push({ key, ent, rawName, entTokens, setMatched });
   }
 
   if (!scored.length) return null;
@@ -405,31 +371,24 @@ function bestEntryForFen(canon, playedTokensAtPly, fullPlayedTokens, options = {
     return 0;
   });
 
-  return { ent: scored[0].ent, key: scored[0].key, rawName: scored[0].rawName, entPly: scored[0].entPly, entTokens: scored[0].entTokens, setMatched: scored[0].setMatched };
+  const top = scored[0];
+  return { ent: top.ent, rawName: top.rawName, entTokens: top.entTokens, setMatched: top.setMatched, key: top.key };
 }
 
-// -------------------------
-// Sequence fallback helper (for per-ply sequence-only matching)
-// -------------------------
+// Sequence-prefix matching helper (returns an example entry)
 function bestSequenceMatchForTokens(seqTokens) {
   if (!Array.isArray(seqTokens) || seqTokens.length === 0) return null;
-
   const candidates = [];
   for (const ent of OPENINGS) {
     if (!ent._moves_norm) continue;
     const entTokens = movesTokensFromNorm(ent._moves_norm || '');
-    if (!entTokens || entTokens.length === 0) continue;
-    // check whether seqTokens is a prefix of entTokens
-    if (entTokens.length < seqTokens.length) continue;
+    if (!entTokens || entTokens.length < seqTokens.length) continue;
     let ok = true;
-    for (let i = 0; i < seqTokens.length; i++) {
-      if (entTokens[i] !== seqTokens[i]) { ok = false; break; }
-    }
+    for (let i = 0; i < seqTokens.length; i++) if (entTokens[i] !== seqTokens[i]) { ok = false; break; }
     if (ok) candidates.push(ent);
   }
-
   if (candidates.length === 0) return null;
-
+  // choose best by raw-name specificity + frequency like earlier
   const rawCounts = new Map();
   const rawToEntries = new Map();
   for (const ent of candidates) {
@@ -439,9 +398,7 @@ function bestSequenceMatchForTokens(seqTokens) {
     arr.push(ent);
     rawToEntries.set(raw, arr);
   }
-  function rawKey(r) {
-    return [specificityScore(r), rawCounts.get(r) || 0];
-  }
+  function rawKey(r) { return [specificityScore(r), rawCounts.get(r) || 0]; }
   let bestRaw = null;
   for (const r of rawCounts.keys()) {
     if (!bestRaw) bestRaw = r;
@@ -450,182 +407,91 @@ function bestSequenceMatchForTokens(seqTokens) {
       if (b[0] > a[0] || (b[0] === a[0] && b[1] > a[1])) bestRaw = r;
     }
   }
-  const exampleEnt = (rawToEntries.get(bestRaw) || [candidates[0]])[0];
-  return exampleEnt || null;
+  return (rawToEntries.get(bestRaw) || [candidates[0]])[0];
 }
 
-// -------------------------
-// Sequence fallback analyzer (original)
-// -------------------------
-function analyzeBySequence(pgnText, maxPlies) {
-  const max_plies = (typeof maxPlies === 'number') ? maxPlies : DEFAULT_MAX_PLIES;
-  const tokens = tokenizePgnMoves(pgnText);
-  if (!tokens || tokens.length === 0) return { error: 'No moves parsed from PGN', opening_path: [], book_moves: [], plies_analyzed: 0 };
-  let candidates = OPENINGS.filter(o => typeof o._moves_norm === 'string' && o._moves_norm);
-  const seqTokens = [];
-  let lastCandidatesSnapshot = candidates.slice();
-  let pliesDone = 0;
-  let candTokensMap = {};
-  for (let i = 0; i < candidates.length; i++) candTokensMap[i] = movesTokensFromNorm(candidates[i]._moves_norm);
-
-  for (let plyIndex = 0; plyIndex < tokens.length && plyIndex < max_plies; plyIndex++) {
-    const tok = tokens[plyIndex];
-    seqTokens.push(tok);
-    const newCands = [];
-    for (let i = 0; i < candidates.length; i++) {
-      const o = candidates[i];
-      const otoks = candTokensMap[i] || movesTokensFromNorm(o._moves_norm);
-      if (isTokenPrefix(seqTokens, otoks)) newCands.push(o);
+// Choose parent opening name (most general fragment) for a sequence via candidates
+function chooseParentForSequence(seqTokens, fenAtPly, firstToken, wholeGameTokens, options = {}) {
+  // Assemble candidate entries: prefer FEN-indexed entries at this fen, otherwise sequence-prefix candidates
+  let candidates = [];
+  const fenCandidates = FEN_TO_ENTRIES.get(fenAtPly) || [];
+  if (fenCandidates && fenCandidates.length > 0) {
+    candidates = fenCandidates.map(r => r.ent).filter(Boolean);
+  } else {
+    // sequence prefix candidates
+    for (const ent of OPENINGS) {
+      if (!ent._moves_norm) continue;
+      const entTokens = movesTokensFromNorm(ent._moves_norm || '');
+      if (!entTokens || entTokens.length < seqTokens.length) continue;
+      let ok = true;
+      for (let i = 0; i < seqTokens.length; i++) if (entTokens[i] !== seqTokens[i]) { ok = false; break; }
+      if (ok) candidates.push(ent);
     }
-    if (newCands.length > 0) {
-      candidates = newCands;
-      lastCandidatesSnapshot = candidates.slice();
-      candTokensMap = {};
-      for (let i = 0; i < candidates.length; i++) candTokensMap[i] = movesTokensFromNorm(candidates[i]._moves_norm);
-    } else {
-      break;
-    }
-    pliesDone = plyIndex + 1;
   }
-  const working = (lastCandidatesSnapshot && lastCandidatesSnapshot.length > 0) ? lastCandidatesSnapshot : candidates;
-  if (!working || working.length === 0) return { opening_path: [], opening: null, book_moves: [], plies_analyzed: pliesDone, max_plies: max_plies };
-  const rawCounts = new Map();
-  const rawToEntries = new Map();
-  for (const ent of working) {
+
+  if (!candidates || candidates.length === 0) {
+    // fallback for ply 1 using popularity mapping
+    if (seqTokens.length === 1 && firstToken) {
+      const list = POPULAR_FIRST_MOVES[firstToken.toLowerCase()] || [];
+      if (list && list.length) return { parent: list[0], chosenEntry: null, allCandidates: [] };
+    }
+    return { parent: null, chosenEntry: null, allCandidates: [] };
+  }
+
+  // For each candidate derive its "parent fragment" (most general fragment returned by buildOpeningPathFromRaw)
+  const parentCounts = new Map();
+  const parentSpecs = new Map();
+  const examples = new Map();
+  for (const ent of candidates) {
     const raw = (ent.name || ent.opening || ent._key || '').toString().trim();
-    rawCounts.set(raw, (rawCounts.get(raw) || 0) + 1);
-    const arr = rawToEntries.get(raw) || [];
-    arr.push(ent);
-    rawToEntries.set(raw, arr);
+    const path = buildOpeningPathFromRaw(raw, firstToken);
+    // buildOpeningPathFromRaw returns fragments where earlier entries are more specific; choose last as most general
+    let parent = null;
+    if (Array.isArray(path) && path.length > 0) parent = path[path.length - 1];
+    else parent = raw || null;
+    if (!parent) continue;
+    parentCounts.set(parent, (parentCounts.get(parent) || 0) + 1);
+    // choose minimal specificity value so tie-breaker favors more general
+    const curSpec = parentSpecs.get(parent) || Infinity;
+    parentSpecs.set(parent, Math.min(curSpec, specificityScore(parent) || 0));
+    if (!examples.has(parent)) examples.set(parent, ent);
   }
-  function rawKey(r) {
-    return [specificityScore(r), rawCounts.get(r) || 0];
-  }
-  let bestRaw = null;
-  for (const r of rawCounts.keys()) {
-    if (!bestRaw) bestRaw = r;
+
+  if (parentCounts.size === 0) return { parent: null, chosenEntry: null, allCandidates: candidates };
+
+  // choose highest count; tie-breaker = lower specificityScore (more general)
+  let bestParent = null;
+  for (const [par, cnt] of parentCounts.entries()) {
+    if (!bestParent) bestParent = par;
     else {
-      const a = rawKey(bestRaw), b = rawKey(r);
-      if (b[0] > a[0] || (b[0] === a[0] && b[1] > a[1])) bestRaw = r;
-    }
-  }
-  const firstToken = tokens[0] || null;
-  const openingPath = buildOpeningPathFromRaw(bestRaw, firstToken);
-  const exampleEnt = (rawToEntries.get(bestRaw) || [working[0]])[0];
-  const ecoCode = exampleEnt.eco;
-  return {
-    opening_path: openingPath,
-    opening: { eco: ecoCode, name: openingPath[openingPath.length - 1] || openingPath[0] || null },
-    book_moves: exampleEnt._moves_norm || [],
-    plies_analyzed: pliesDone,
-    max_plies: max_plies,
-  };
-}
-
-// -------------------------
-// New helper: build parent chain (general -> specific) following PGN
-// -------------------------
-function buildParentChainFromFenPerPly(fenPerPly, matchedPly, firstToken, wholeGameTokens) {
-  // returns array of parent names (most general -> more specific) for plies 1..matchedPly
-  const parentChain = [];
-  const seen = new Set();
-
-  for (let p = 1; p <= matchedPly; p++) {
-    const rec = fenPerPly[p - 1];
-    if (!rec) continue;
-    const seqTokensAtPly = rec.played_tokens || [];
-
-    // get candidates from FEN index first
-    let candidates = [];
-    const fenCandidates = FEN_TO_ENTRIES.get(rec.fen) || [];
-    if (fenCandidates && fenCandidates.length > 0) {
-      candidates = fenCandidates.map(r => r.ent).filter(Boolean);
-    } else {
-      // fallback: sequence-prefix candidates
-      for (const ent of OPENINGS) {
-        if (!ent._moves_norm) continue;
-        const entTokens = movesTokensFromNorm(ent._moves_norm || '');
-        if (!entTokens || entTokens.length < seqTokensAtPly.length) continue;
-        let ok = true;
-        for (let i = 0; i < seqTokensAtPly.length; i++) {
-          if (entTokens[i] !== seqTokensAtPly[i]) { ok = false; break; }
-        }
-        if (ok) candidates.push(ent);
+      const bestCnt = parentCounts.get(bestParent) || 0;
+      if (cnt > bestCnt) bestParent = par;
+      else if (cnt === bestCnt) {
+        const aSpec = parentSpecs.get(bestParent) || 0;
+        const bSpec = parentSpecs.get(par) || 0;
+        if (bSpec < aSpec) bestParent = par;
       }
-    }
-
-    if (!candidates || candidates.length === 0) {
-      // if no candidates, consider POPULAR_FIRST_MOVES for first ply
-      if (p === 1 && firstToken) {
-        const list = POPULAR_FIRST_MOVES[firstToken.toLowerCase()] || [];
-        if (list.length > 0) {
-          const parent = list[0];
-          if (!seen.has(parent)) { parentChain.push(parent); seen.add(parent); }
-        }
-      }
-      continue;
-    }
-
-    // derive "parent name" per candidate by using buildOpeningPathFromRaw and taking the most general fragment (last)
-    const parentCounts = new Map();
-    const parentSpecs = new Map();
-    for (const ent of candidates) {
-      const raw = (ent.name || ent.opening || ent._key || '').toString().trim();
-      const path = buildOpeningPathFromRaw(raw, firstToken);
-      let parent = null;
-      if (path && path.length > 0) {
-        parent = path[path.length - 1]; // most general fragment returned by buildOpeningPathFromRaw
-      } else {
-        parent = raw || null;
-      }
-      if (!parent) continue;
-      parentCounts.set(parent, (parentCounts.get(parent) || 0) + 1);
-      parentSpecs.set(parent, Math.min(parentSpecs.get(parent) || Infinity, specificityScore(parent) || 0));
-    }
-
-    if (parentCounts.size === 0) continue;
-
-    // choose the parent with highest frequency; tie-breaker = lower specificityScore (more general)
-    let bestParent = null;
-    for (const [par, cnt] of parentCounts.entries()) {
-      if (!bestParent) bestParent = par;
-      else {
-        const bestCnt = parentCounts.get(bestParent) || 0;
-        if (cnt > bestCnt) bestParent = par;
-        else if (cnt === bestCnt) {
-          const aSpec = parentSpecs.get(bestParent) || 0;
-          const bSpec = parentSpecs.get(par) || 0;
-          if (bSpec < aSpec) bestParent = par;
-        }
-      }
-    }
-
-    if (bestParent && !seen.has(bestParent)) {
-      parentChain.push(bestParent);
-      seen.add(bestParent);
     }
   }
 
-  return parentChain;
+  return { parent: bestParent, chosenEntry: examples.get(bestParent) || null, allCandidates: candidates };
 }
 
 // -------------------------
-// FEN-based analyzer with walk-up, per_level, orderless matching, and per-ply summary
+// Main analyzer: move-by-move up to N plies
 // -------------------------
-function analyzeByFen(pgnText, maxPlies, requireFenOnly = false, debug = false, opts = {}) {
-  // opts: { orderless_matching: bool, orderless_threshold: number, prefer_set_matches: bool }
+function analyzeMoveByMove(pgnText, maxPlies, options = {}) {
+  // options: { max_report_plies: number, orderless_matching, orderless_threshold, prefer_set_matches, debug }
   const max_plies = (typeof maxPlies === 'number') ? maxPlies : DEFAULT_MAX_PLIES;
   const tokens = tokenizePgnMoves(pgnText);
-  if (!tokens || tokens.length === 0) return { error: 'No moves parsed from PGN', opening_path: [], book_moves: [], plies_analyzed: 0 };
+  if (!tokens || tokens.length === 0) return { error: 'No moves parsed from PGN', ply_results: [], summary_lines: [] };
 
-  // play the game and record FENs + seq strings
   const board = new Chess();
   const fenPerPly = [];
   const seqTokens = [];
-  let pliesDone = 0;
 
-  for (let plyIndex = 0; plyIndex < tokens.length && plyIndex < max_plies; plyIndex++) {
-    const tok = tokens[plyIndex];
+  for (let i = 0; i < tokens.length && i < max_plies; i++) {
+    const tok = tokens[i];
     let ok = false;
     try {
       const mv = board.move(tok, { sloppy: true });
@@ -634,11 +500,8 @@ function analyzeByFen(pgnText, maxPlies, requireFenOnly = false, debug = false, 
     if (!ok) {
       const uciMatch = tok.match(/^([a-h][1-8])([a-h][1-8])([qrbn])?$/i);
       if (uciMatch) {
-        const from = uciMatch[1];
-        const to = uciMatch[2];
-        const prom = uciMatch[3];
-        const moveObj = { from: from.toLowerCase(), to: to.toLowerCase() };
-        if (prom) moveObj.promotion = prom.toLowerCase();
+        const moveObj = { from: uciMatch[1].toLowerCase(), to: uciMatch[2].toLowerCase() };
+        if (uciMatch[3]) moveObj.promotion = uciMatch[3].toLowerCase();
         try {
           const mv2 = board.move(moveObj);
           if (mv2) ok = true;
@@ -648,215 +511,62 @@ function analyzeByFen(pgnText, maxPlies, requireFenOnly = false, debug = false, 
     if (!ok) break;
     seqTokens.push(tok);
     const canon = canonicalFenFromChessInstance(board);
-    fenPerPly.push({ ply: plyIndex + 1, san: tok, fen: canon, played_tokens: seqTokens.slice() });
-    pliesDone = plyIndex + 1;
+    fenPerPly.push({ ply: i + 1, san: tok, fen: canon, played_tokens: seqTokens.slice() });
   }
 
-  // fallback early if no FENs parsed (tokenizer or malformed PGN)
-  if (fenPerPly.length === 0) {
-    if (requireFenOnly) {
-      const out = { opening_path: [], opening: null, book_moves: [], matched_fen: null, plies_analyzed: 0, max_plies: max_plies, error: 'no_fens_parsed' };
-      if (debug) out.debug = { fen_per_ply: fenPerPly };
-      return out;
-    } else {
-      // return sequence fallback (full-game)
-      const seq = analyzeBySequence(pgnText, max_plies);
-      seq.matched_fen = null;
-      if (debug) seq.debug = { fen_per_ply: fenPerPly, note: 'no_fens_parsed' };
-      return seq;
-    }
-  }
-
-  function commonPrefixLen(a, b) {
-    const n = Math.min(a.length, b.length);
-    for (let i = 0; i < n; i++) if (a[i] !== b[i]) return i;
-    return n;
-  }
-
-  // prepare whole-game tokens array for orderless set checks
   const wholeGameTokens = fenPerPly.map(r => r.san).filter(Boolean);
+  const results = [];
+  const summaryLines = [];
 
-  // Build per-ply summary (progressive mapping)
-  const per_ply = [];
-  const ply_progression = []; // human-readable strings
+  const pliesToReport = Math.min(fenPerPly.length, options.max_report_plies || MAX_PLIES_TO_REPORT);
 
-  for (let i = 0; i < fenPerPly.length; i++) {
-    const rec = fenPerPly[i];
-    const ply = rec.ply;
-    const seqTokensAtPly = rec.played_tokens || [];
-    const seqStr = buildSequenceString(seqTokensAtPly);
-    let chosenName = null;
-    let chosenEco = null;
-    let chosenPath = [];
-    let chosen_raw = null;
-
-    // Try FEN-based exact or best match first
-    const bestByFen = bestEntryForFen(rec.fen, seqTokensAtPly, wholeGameTokens, {
-      preferSetMatch: !!opts.prefer_set_matches,
-      setThreshold: (typeof opts.orderless_threshold === 'number') ? opts.orderless_threshold : 1.0
-    });
-
-    if (bestByFen && bestByFen.ent) {
-      chosen_raw = bestByFen.rawName;
-      chosenEco = bestByFen.ent.eco || null;
-      chosenPath = buildOpeningPathFromRaw(chosen_raw, tokens[0] || null);
-      chosenName = chosenPath[0] || (bestByFen.ent.name || bestByFen.ent.opening || bestByFen.ent._key);
+  for (let pi = 0; pi < pliesToReport; pi++) {
+    const rec = fenPerPly[pi];
+    const seq = rec.played_tokens || [];
+    const seqStr = buildSequenceString(seq);
+    // choose parent name for this cumulative sequence
+    const choice = chooseParentForSequence(seq, rec.fen, tokens[0] || null, wholeGameTokens, options);
+    let parentName = choice.parent || null;
+    let eco = null;
+    let opening_path = [];
+    if (choice.chosenEntry) {
+      eco = choice.chosenEntry.eco || null;
+      opening_path = buildOpeningPathFromRaw((choice.chosenEntry.name || choice.chosenEntry.opening || choice.chosenEntry._key) || '', tokens[0] || null);
+    } else if (parentName) {
+      opening_path = [parentName];
     } else {
-      // Fallback to sequence-only matching for this ply
-      const seqMatchEnt = bestSequenceMatchForTokens(seqTokensAtPly);
-      if (seqMatchEnt) {
-        chosen_raw = (seqMatchEnt.name || seqMatchEnt.opening || seqMatchEnt._key || '').toString().trim();
-        chosenEco = seqMatchEnt.eco || null;
-        chosenPath = buildOpeningPathFromRaw(chosen_raw, tokens[0] || null);
-        chosenName = chosenPath[0] || seqMatchEnt.name || seqMatchEnt.opening || seqMatchEnt._key;
-      } else {
-        // Last resort: use POPULAR_FIRST_MOVES for single first ply white move
-        if (seqTokensAtPly.length === 1) {
-          const first = (seqTokensAtPly[0] || '').toLowerCase();
-          const list = POPULAR_FIRST_MOVES[first];
-          if (list && list.length) {
-            chosenName = list[0];
-            chosenPath = [chosenName];
-          }
-        }
+      // fallback: try sequence-match example to provide an opening path and eco
+      const seqEnt = bestSequenceMatchForTokens(seq);
+      if (seqEnt) {
+        eco = seqEnt.eco || null;
+        opening_path = buildOpeningPathFromRaw((seqEnt.name || seqEnt.opening || seqEnt._key) || '', tokens[0] || null);
+        // choose parent from that opening_path (most general)
+        if (opening_path && opening_path.length > 0) parentName = opening_path[opening_path.length - 1];
       }
     }
 
-    per_ply.push({
-      ply,
+    // another fallback: for ply 1 use POPULAR_FIRST_MOVES
+    if (!parentName && seq.length === 1 && tokens[0]) {
+      const pop = POPULAR_FIRST_MOVES[(tokens[0] || '').toLowerCase()] || [];
+      if (pop.length > 0) parentName = pop[0];
+      if (!opening_path.length && parentName) opening_path = [parentName];
+    }
+
+    const res = {
+      ply: rec.ply,
       sequence: seqStr,
-      sequence_tokens: seqTokensAtPly.slice(),
-      opening: chosenName,
-      eco: chosenEco,
-      opening_path: chosenPath,
+      sequence_tokens: seq.slice(),
+      parent_opening: parentName,
+      eco: eco,
+      opening_path: opening_path,
       matched_fen: rec.fen
-    });
+    };
 
-    // human-readable
-    const human = `${seqStr} → ${chosenName || 'unknown'}` + (chosenEco ? ` (${chosenEco})` : '');
-    ply_progression.push(human);
+    results.push(res);
+    summaryLines.push(`${seqStr} → ${parentName || 'unknown'}` + (eco ? ` (${eco})` : ''));
   }
 
-  // First: find the best specific entry by scanning deepest -> shallowest (existing logic)
-  let bestTopLevelChoice = null;
-  for (let ri = fenPerPly.length - 1; ri >= 0; ri--) {
-    const record = fenPerPly[ri];
-    const playedTokensAtPly = record.played_tokens;
-    const entryChoice = bestEntryForFen(record.fen, playedTokensAtPly, wholeGameTokens, {
-      preferSetMatch: !!opts.prefer_set_matches,
-      setThreshold: (typeof opts.orderless_threshold === 'number') ? opts.orderless_threshold : 1.0
-    });
-    if (!entryChoice || !entryChoice.ent) continue;
-    bestTopLevelChoice = { record, entryChoice };
-    break;
-  }
-
-  if (!bestTopLevelChoice) {
-    // No FEN-based top-level match found: fallback to sequence analyzer but include per-ply progression
-    if (requireFenOnly) {
-      const out = { opening_path: [], opening: null, book_moves: [], matched_fen: null, plies_analyzed: pliesDone, max_plies: max_plies, error: 'no_fen_match', per_ply: per_ply, ply_progression: ply_progression };
-      if (debug) out.debug = { fen_per_ply: fenPerPly };
-      return out;
-    } else {
-      const seq = analyzeBySequence(pgnText, max_plies);
-      seq.matched_fen = null;
-      seq.per_ply = per_ply;
-      seq.ply_progression = ply_progression;
-      if (debug) seq.debug = { fen_per_ply: fenPerPly };
-      return seq;
-    }
-  }
-
-  // We have a top-level specific entry
-  const chosen = bestTopLevelChoice.entryChoice.ent;
-  const chosenRaw = bestTopLevelChoice.entryChoice.rawName;
-  const ecoCode = chosen.eco;
-  const matchedPly = bestTopLevelChoice.entryChoice.entPly || bestTopLevelChoice.record.ply;
-
-  // Build parent chain (general -> specific) from ply 1 -> matchedPly
-  const parentChain = buildParentChainFromFenPerPly(fenPerPly, matchedPly, tokens[0] || null, wholeGameTokens);
-
-  // Now add final specific opening fragments (most specific last)
-  const chosenFragments = buildOpeningPathFromRaw(chosenRaw, tokens[0] || null) || [];
-  // chosenFragments usually returns [specific, ..., general]. We want general->...->specific
-  const chosenFragmentsGeneralToSpecific = chosenFragments.slice().reverse();
-
-  // Merge parentChain and chosenFragmentsGeneralToSpecific, preserving order and removing duplicates
-  const finalPath = [];
-  const seenFinal = new Set();
-  for (const p of parentChain) {
-    if (p && !seenFinal.has(p)) { finalPath.push(p); seenFinal.add(p); }
-  }
-  for (const p of chosenFragmentsGeneralToSpecific) {
-    if (p && !seenFinal.has(p)) { finalPath.push(p); seenFinal.add(p); }
-  }
-
-  // If finalPath is empty, fallback to buildOpeningPathFromRaw(chosenRaw) as before (reversed to general->spec)
-  if (finalPath.length === 0 && chosenFragments && chosenFragments.length > 0) {
-    const fallback = chosenFragments.slice().reverse();
-    for (const p of fallback) if (!seenFinal.has(p)) { finalPath.push(p); seenFinal.add(p); }
-  }
-
-  // Make sure most specific is last (opening.name)
-  const mostSpecific = finalPath.length ? finalPath[finalPath.length - 1] : (chosenFragments[0] || chosen.name || null);
-
-  // top-level output
-  const out = {
-    opening_path: finalPath,
-    opening: { eco: ecoCode || null, name: mostSpecific || null },
-    book_moves: chosen._moves_norm || chosen.moves || [],
-    matched_fen: bestTopLevelChoice.record.fen,
-    plies_analyzed: matchedPly,
-    max_plies: max_plies,
-    per_level: [], // legacy per_level info can be re-created if desired
-    per_ply: per_ply,
-    ply_progression: ply_progression
-  };
-
-  // Optionally populate per_level similar to previous behavior (walk-up matches)
-  // We'll keep it similar to the original per_level so it remains useful for debugging
-  const per_level = [];
-  const seenLevels = new Set();
-  for (let p = matchedPly; p >= 1; p--) {
-    const rec = fenPerPly[p - 1];
-    if (!rec) continue;
-    const best = bestEntryForFen(rec.fen, rec.played_tokens || [], wholeGameTokens, {
-      preferSetMatch: !!opts.prefer_set_matches,
-      setThreshold: (typeof opts.orderless_threshold === 'number') ? opts.orderless_threshold : 1.0
-    });
-
-    const level = { ply: p, fen: rec.fen, chosen: null, chosen_raw: null, eco: null, moves_leading: (rec.played_tokens || []).slice(), matched_by_set: false, matched_tokens: [], matched_tokens_positions: [] };
-    if (best && best.ent) {
-      const ent = best.ent;
-      const entTokens = best.entTokens || movesTokensFromNorm(ent._moves_norm || '');
-      level.chosen = { _key: ent._key, name: ent.name || ent.opening || ent._key, eco: ent.eco || null };
-      level.chosen_raw = best.rawName;
-      level.eco = ent.eco || null;
-      level.matched_by_set = entryMatchesBySetFraction(entTokens, wholeGameTokens, (typeof opts.orderless_threshold === 'number' ? opts.orderless_threshold : 1.0));
-      level.matched_tokens = entTokens.slice(0, Math.min(entTokens.length, 64));
-      level.matched_tokens_positions = findMatchedTokensPositions(entTokens, wholeGameTokens);
-      if (best.rawName && !seenLevels.has(best.rawName)) { per_level.push(level); seenLevels.add(best.rawName); }
-    } else {
-      const altRefs = FEN_TO_ENTRIES.get(rec.fen) || [];
-      if (altRefs.length > 0) {
-        const alt = altRefs[0].ent;
-        const altName = ((alt.name || alt.opening || alt._key) || '').toString().trim();
-        level.chosen = { _key: alt._key, name: alt.name || alt.opening || alt._key, eco: alt.eco || null };
-        level.chosen_raw = altName;
-        level.eco = alt.eco || null;
-        level.moves_leading = movesForPly(fenPerPly, p);
-        if (altName && !seenLevels.has(altName)) { per_level.push(level); seenLevels.add(altName); }
-      }
-    }
-  }
-  out.per_level = per_level;
-
-  if (debug) {
-    out.debug = out.debug || {};
-    out.debug.fen_per_ply = fenPerPly;
-  }
-
-  return out;
+  return { ply_results: results, summary_lines: summaryLines, total_plies: fenPerPly.length };
 }
 
 // -------------------------
@@ -899,20 +609,14 @@ function createApp() {
     const pgn = data.pgn;
     const maxPlies = parseInt(data.max_plies || DEFAULT_MAX_PLIES, 10);
     const callback = data.callback_url || data.callback || DEFAULT_CALLBACK_URL;
-    const requireFenOnly = !!data.require_fen_only;
     const debug = !!data.debug;
-
-    // new options
-    const orderless_matching = !!data.orderless_matching;
-    const orderless_threshold = (typeof data.orderless_threshold === 'number') ? Math.max(0, Math.min(1, data.orderless_threshold)) : 1.0;
-    const prefer_set_matches = !!data.prefer_set_matches;
+    const maxReport = parseInt(data.max_report_plies || MAX_PLIES_TO_REPORT, 10);
 
     if (!pgn || typeof pgn !== 'string' || !pgn.trim()) return res.status(400).json({ error: 'No PGN provided (send JSON: {"pgn":"1. e4 e5 ..."})' });
 
     try {
-      const out = analyzeByFen(pgn.trim(), maxPlies, requireFenOnly, debug, { orderless_matching, orderless_threshold, prefer_set_matches });
-      // annotate with options used
-      out._options = { orderless_matching, orderless_threshold, prefer_set_matches };
+      const out = analyzeMoveByMove(pgn.trim(), maxPlies, { max_report_plies: maxReport, debug });
+      out._options = { max_report_plies: maxReport };
       if (callback) {
         const postInfo = await postResultToServer(callback, out);
         out._post_result = postInfo;
@@ -928,7 +632,7 @@ function createApp() {
 }
 
 // -------------------------
-// Poll loop
+// Poll / CLI / main
 // -------------------------
 async function pollLoop(pollUrl, pollInterval, stopSignal) {
   const headers = POLL_AUTH_HEADER ? { Authorization: POLL_AUTH_HEADER } : {};
@@ -946,7 +650,7 @@ async function pollLoop(pollUrl, pollInterval, stopSignal) {
       const callback = job.callback_url || job.callback || DEFAULT_CALLBACK_URL;
       logInfo('Got job from poll: max_plies=', max_plies, 'callback=', !!callback);
       try {
-        const out = analyzeByFen(pgn, max_plies);
+        const out = analyzeMoveByMove(pgn, max_plies, { max_report_plies: MAX_PLIES_TO_REPORT });
         if (callback) {
           const postInfo = await postResultToServer(callback, out);
           logInfo('Posted results to callback:', postInfo);
@@ -966,11 +670,8 @@ async function pollLoop(pollUrl, pollInterval, stopSignal) {
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
-// -------------------------
-// Main entry
-// -------------------------
 async function main(argv) {
-  const args = require('minimist')(argv || process.argv.slice(2), { boolean: ['serve', 'poll'], string: ['pgn-file'] });
+  const args = require('minimist')(argv || process.argv.slice(2), { boolean: ['serve','poll'], string: ['pgn-file'] });
 
   const inputEnv = process.env.INPUT;
 
@@ -985,13 +686,10 @@ async function main(argv) {
       const pgn = inputData.pgn;
       const max_plies = parseInt(inputData.max_plies || DEFAULT_MAX_PLIES, 10);
       const callback = inputData.callback_url || inputData.callback || DEFAULT_CALLBACK_URL;
-      const require_fen_only = !!inputData.require_fen_only;
       const debug = !!inputData.debug;
-      const orderless_matching = !!inputData.orderless_matching;
-      const orderless_threshold = (typeof inputData.orderless_threshold === 'number') ? Math.max(0, Math.min(1, inputData.orderless_threshold)) : 1.0;
-      const prefer_set_matches = !!inputData.prefer_set_matches;
+      const maxReport = parseInt(inputData.max_report_plies || MAX_PLIES_TO_REPORT, 10);
       if (!pgn) { logError("INPUT provided but no 'pgn' field"); process.exit(1); }
-      const out = analyzeByFen(pgn, max_plies, require_fen_only, debug, { orderless_matching, orderless_threshold, prefer_set_matches });
+      const out = analyzeMoveByMove(pgn, max_plies, { max_report_plies: maxReport, debug });
       if (callback) {
         const postInfo = await postResultToServer(callback, out);
         out._post_result = postInfo;
@@ -1031,7 +729,7 @@ async function main(argv) {
     if (!pgnText.trim()) { logError('No PGN provided'); process.exit(1); }
     const max_plies = args['max-plies'] || DEFAULT_MAX_PLIES;
     try {
-      const out = analyzeByFen(pgnText, max_plies, !!args['require-fen-only'], !!args.debug);
+      const out = analyzeMoveByMove(pgnText, max_plies, { max_report_plies: MAX_PLIES_TO_REPORT });
       console.log(JSON.stringify(out, null, 2));
     } catch (exc) {
       logError('Error parsing/analyzing PGN:', exc && exc.message);
@@ -1046,7 +744,7 @@ async function main(argv) {
   if (!stdin.trim()) { logError('No PGN provided'); process.exit(1); }
   const max_plies = args['max-plies'] || DEFAULT_MAX_PLIES;
   try {
-    const out = analyzeByFen(stdin, max_plies, !!args['require-fen-only'], !!args.debug);
+    const out = analyzeMoveByMove(stdin, max_plies, { max_report_plies: MAX_PLIES_TO_REPORT });
     console.log(JSON.stringify(out, null, 2));
   } catch (exc) {
     logError('Error parsing/analyzing PGN:', exc && exc.message);
@@ -1056,4 +754,3 @@ async function main(argv) {
 
 if (require.main === module) main();
 
-// End of file
