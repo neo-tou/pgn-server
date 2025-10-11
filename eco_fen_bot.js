@@ -1,37 +1,13 @@
 #!/usr/bin/env node
 /*
-  eco_fen_bot.js
+  eco_fen_bot.js - rewritten with "walk-up" hierarchical path and orderless matching.
 
-  Node.js translation of the provided Python "ECO FEN-match opening-check bot".
-  Features preserved:
-   - loads ECO JSON file and indexes intermediate canonical FENs (ply aware)
-   - canonical FEN (first 4 fields) handling
-   - sequence (token-prefix) fallback analyzer
-   - FEN-first analyzer preferring entries whose move-seq is a prefix and which reach the FEN at same ply
-   - London heuristic soft override
-   - Express endpoints: /health, /debug_openings, /analyze
-   - optional poll loop mode
+  Usage / notes: same as original. New POST /analyze options:
+    - orderless_matching: boolean (default false)  -- report & optionally prefer set-matches
+    - orderless_threshold: number between 0 and 1 (default 1.0) -- fraction of tokens required for set-match
 
-  Notes:
-   - Intended to run with Node >= 14
-   - Dependencies: express, axios, chess.js
-   - Install: npm i express axios chess.js
-
-  Usage examples:
-   - node eco_fen_bot.js --serve
-   - node eco_fen_bot.js --pgn-file sample.pgn
-   - INPUT environment variable may contain a JSON object similar to the Python implementation
-
-  Environment variables supported (defaults shown):
-   PORT=8080
-   DEFAULT_MAX_PLIES=9999
-   POST_TIMEOUT=8
-   POLL_URL=""
-   POLL_INTERVAL=5
-   POLL_AUTH_HEADER=""
-   DEFAULT_CALLBACK_URL=""
-   LOG_LEVEL=info
-   ECO_FILE=eco_interpolated.json
+  Dependencies: express, axios, chess.js, cors, minimist
+  Install: npm i express axios chess.js cors minimist
 */
 
 const fs = require('fs');
@@ -106,7 +82,7 @@ function tokenizePgnMoves(pgnText) {
       i++;
       continue;
     }
-    // skip variations (...)
+    // skip variations (... )
     if (t.startsWith('(')) {
       while (i < rawTokens.length && !rawTokens[i].includes(')')) i++;
       i++;
@@ -194,7 +170,6 @@ function buildOpeningPathFromRaw(rawName, firstToken) {
 // FEN canonicalization & ECO loader
 // -------------------------
 function canonicalFenFromChessInstance(chessInstance) {
-  // chess.js fen -> we return first 4 fields
   const fen = chessInstance.fen();
   const parts = fen.split(' ');
   return parts.slice(0, 4).join(' ');
@@ -205,8 +180,6 @@ function canonicalizeFenString(fen) {
   fen = fen.trim();
   try {
     const c = new Chess(fen);
-    // if fen invalid chess.js will reset to starting position but throw? it doesn't throw; check validity
-    // We'll check that fen has piece placement component
     if (!fen.split(' ')[0]) return null;
     return canonicalFenFromChessInstance(new Chess(fen));
   } catch (e) {
@@ -223,15 +196,11 @@ function computeFensFromMovesString(moves) {
   const board = new Chess();
   for (const tok of toks) {
     let ok = false;
-    // try SAN
     try {
       const mv = board.move(tok, { sloppy: true });
       if (mv) ok = true;
-    } catch (e) {
-      ok = false;
-    }
+    } catch (e) { ok = false; }
     if (!ok) {
-      // try interpret as UCI 'e2e4' or 'e7e8q'
       const uciMatch = tok.match(/^([a-h][1-8])([a-h][1-8])([qrbn])?$/i);
       if (uciMatch) {
         const from = uciMatch[1];
@@ -242,12 +211,10 @@ function computeFensFromMovesString(moves) {
         try {
           const mv2 = board.move(moveObj);
           if (mv2) ok = true;
-        } catch (e) {
-          ok = false;
-        }
+        } catch (e) { ok = false; }
       }
     }
-    if (!ok) break; // stop on unparseable move
+    if (!ok) break;
     result.push(canonicalFenFromChessInstance(board));
   }
   return result;
@@ -269,10 +236,10 @@ function loadOpeningsFromEco(filename) {
   const openings = [];
   const fenIndex = new Map(); // Map<canonFen, Array<{ent, ply}>>
 
+
   function addToIndex(canon, ent, ply) {
     if (!canon) return;
     const arr = fenIndex.get(canon) || [];
-    // avoid duplicates (same ent & same ply)
     if (!arr.some(r => r.ent === ent && r.ply === ply)) arr.push({ ent, ply });
     fenIndex.set(canon, arr);
   }
@@ -301,7 +268,6 @@ function loadOpeningsFromEco(filename) {
     openings.push(ent);
   }
 
-  // build fen_index
   for (const ent of openings) {
     if (ent._fen) addToIndex(ent._fen, ent, null);
     for (const [fen, ply] of Object.entries(ent._fen_to_ply || {})) addToIndex(fen, ent, ply);
@@ -329,6 +295,107 @@ function isTokenPrefix(prefix, full) {
 }
 
 // -------------------------
+// New helpers for orderless matching and "which moves led to entry"
+// -------------------------
+function entryMatchesBySetFraction(entTokens, playedTokens, thresholdFraction) {
+  if (!Array.isArray(entTokens) || entTokens.length === 0) return false;
+  if (!Array.isArray(playedTokens) || playedTokens.length === 0) return false;
+  let found = 0;
+  const playedSet = new Set(playedTokens);
+  for (const tok of entTokens) if (playedSet.has(tok)) found++;
+  const frac = found / entTokens.length;
+  return frac >= (typeof thresholdFraction === 'number' ? thresholdFraction : 1.0);
+}
+
+function findMatchedTokensPositions(entTokens, playedTokens) {
+  const out = [];
+  const lookup = new Map();
+  for (let i = 0; i < playedTokens.length; i++) {
+    const t = playedTokens[i];
+    const arr = lookup.get(t) || [];
+    arr.push(i + 1); // 1-based token index
+    lookup.set(t, arr);
+  }
+  for (const tok of entTokens) {
+    const indices = lookup.get(tok) || [];
+    out.push({ token: tok, indices });
+  }
+  return out;
+}
+
+function movesForPly(fenPerPly, ply) {
+  if (!Array.isArray(fenPerPly) || fenPerPly.length === 0) return [];
+  if (!ply || ply < 1) return [];
+  const rec = fenPerPly[ply - 1];
+  if (!rec) return [];
+  return rec.played_tokens ? rec.played_tokens.slice() : [];
+}
+
+// ---------- helper: best entry selection for a canonical FEN ----------
+function bestEntryForFen(canon, playedTokensAtPly, fullPlayedTokens, options = {}) {
+  // options: { preferSetMatch: boolean, setThreshold: 1.0 }
+  const candRefs = FEN_TO_ENTRIES.get(canon) || [];
+  if (!candRefs || candRefs.length === 0) return null;
+  const playedLen = (playedTokensAtPly && playedTokensAtPly.length) || 0;
+  const scored = [];
+
+  for (const ref of candRefs) {
+    const ent = ref.ent;
+    const entPly = ref.ply;
+    const rawName = ((ent.name || ent.opening || ent._key) || '').toString().trim();
+    const entMovesNorm = ent._moves_norm || '';
+    const entTokens = movesTokensFromNorm(entMovesNorm);
+
+    // prefix check vs played tokens at this ply
+    const minLen = Math.min(entTokens.length, playedLen);
+    let mismatch = false;
+    if (minLen > 0) {
+      for (let i = 0; i < minLen; i++) if (entTokens[i] !== playedTokensAtPly[i]) { mismatch = true; break; }
+      if (mismatch) continue;
+    }
+
+    const samePly = (ent._fen_to_ply && ent._fen_to_ply[canon] === playedLen) ? 1 : 0;
+    const reachesCanon = (ent._fen_to_ply && ent._fen_to_ply[canon] != null) ? 1 : 0;
+    const commonLen = (function () {
+      const n = Math.min(entTokens.length, playedTokensAtPly.length);
+      for (let i = 0; i < n; i++) if (entTokens[i] !== playedTokensAtPly[i]) return i;
+      return n;
+    })();
+    const entryFullyMatchedByPlay = (entTokens.length <= playedLen) ? 1 : 0;
+    const movesLen = entTokens.length;
+    const spec = specificityScore(rawName);
+
+    // orderless/set-match metric
+    const setThreshold = (options && typeof options.setThreshold === 'number') ? options.setThreshold : 1.0;
+    const setMatched = entryMatchesBySetFraction(entTokens, fullPlayedTokens || [], setThreshold) ? 1 : 0;
+
+    // build scoring key; if preferSetMatch, weight setMatched higher
+    let key;
+    if (options && options.preferSetMatch) {
+      key = [setMatched, samePly, reachesCanon, commonLen, entryFullyMatchedByPlay, -movesLen, spec];
+    } else {
+      key = [samePly, reachesCanon, commonLen, entryFullyMatchedByPlay, -movesLen, spec, setMatched];
+    }
+
+    scored.push({ key, ent, entPly, rawName, entTokens, setMatched });
+  }
+
+  if (!scored.length) return null;
+
+  scored.sort((a, b) => {
+    const A = a.key, B = b.key;
+    for (let i = 0; i < Math.max(A.length, B.length); i++) {
+      const av = (typeof A[i] === 'number') ? A[i] : 0;
+      const bv = (typeof B[i] === 'number') ? B[i] : 0;
+      if (av !== bv) return bv - av;
+    }
+    return 0;
+  });
+
+  return { ent: scored[0].ent, key: scored[0].key, rawName: scored[0].rawName, entPly: scored[0].entPly, entTokens: scored[0].entTokens, setMatched: scored[0].setMatched };
+}
+
+// -------------------------
 // Sequence fallback analyzer
 // -------------------------
 function analyzeBySequence(pgnText, maxPlies) {
@@ -339,7 +406,6 @@ function analyzeBySequence(pgnText, maxPlies) {
   const seqTokens = [];
   let lastCandidatesSnapshot = candidates.slice();
   let pliesDone = 0;
-  // pre-tokenize candidate move lists for faster prefix checks
   let candTokensMap = {};
   for (let i = 0; i < candidates.length; i++) candTokensMap[i] = movesTokensFromNorm(candidates[i]._moves_norm);
 
@@ -355,7 +421,6 @@ function analyzeBySequence(pgnText, maxPlies) {
     if (newCands.length > 0) {
       candidates = newCands;
       lastCandidatesSnapshot = candidates.slice();
-      // rebuild candTokensMap for reduced set
       candTokensMap = {};
       for (let i = 0; i < candidates.length; i++) candTokensMap[i] = movesTokensFromNorm(candidates[i]._moves_norm);
     } else {
@@ -377,7 +442,6 @@ function analyzeBySequence(pgnText, maxPlies) {
   function rawKey(r) {
     return [specificityScore(r), rawCounts.get(r) || 0];
   }
-  // pick best raw by custom key
   let bestRaw = null;
   for (const r of rawCounts.keys()) {
     if (!bestRaw) bestRaw = r;
@@ -400,9 +464,10 @@ function analyzeBySequence(pgnText, maxPlies) {
 }
 
 // -------------------------
-// FEN-based analyzer
+// FEN-based analyzer with walk-up, per_level, orderless matching
 // -------------------------
-function analyzeByFen(pgnText, maxPlies, requireFenOnly = false, debug = false) {
+function analyzeByFen(pgnText, maxPlies, requireFenOnly = false, debug = false, opts = {}) {
+  // opts: { orderless_matching: bool, orderless_threshold: number, prefer_set_matches: bool }
   const max_plies = (typeof maxPlies === 'number') ? maxPlies : DEFAULT_MAX_PLIES;
   const tokens = tokenizePgnMoves(pgnText);
   if (!tokens || tokens.length === 0) return { error: 'No moves parsed from PGN', opening_path: [], book_moves: [], plies_analyzed: 0 };
@@ -447,6 +512,9 @@ function analyzeByFen(pgnText, maxPlies, requireFenOnly = false, debug = false) 
     return n;
   }
 
+  // prepare whole-game tokens array for orderless set checks
+  const wholeGameTokens = fenPerPly.map(r => r.san).filter(Boolean);
+
   // search from deepest ply -> shallowest
   let bestOut = null;
   for (let ri = fenPerPly.length - 1; ri >= 0; ri--) {
@@ -459,74 +527,96 @@ function analyzeByFen(pgnText, maxPlies, requireFenOnly = false, debug = false) 
     const candRefs = FEN_TO_ENTRIES.get(canon) || [];
     if (!candRefs || candRefs.length === 0) continue;
 
-    const scored = [];
-    const debugCands = [];
-
-    for (const ref of candRefs) {
-      const ent = ref.ent;
-      const entPly = ref.ply; // may be null
-      const rawName = ((ent.name || ent.opening || ent._key) || '').toString().trim();
-      const entMovesNorm = ent._moves_norm || '';
-      const entTokens = movesTokensFromNorm(entMovesNorm);
-
-      const minLen = Math.min(entTokens.length, playedLen);
-      if (minLen === 0) {
-        // accept but deprioritize
-      } else {
-        let mismatch = false;
-        for (let i = 0; i < minLen; i++) if (entTokens[i] !== playedTokensAtPly[i]) { mismatch = true; break; }
-        if (mismatch) continue; // reject
-      }
-
-      const samePly = (ent._fen_to_ply && ent._fen_to_ply[canon] === ply) ? 1 : 0;
-      const reachesCanon = (ent._fen_to_ply && ent._fen_to_ply[canon] != null) ? 1 : 0;
-      const commonLen = commonPrefixLen(entTokens, playedTokensAtPly);
-      const entryFullyMatchedByPlay = (entTokens.length <= playedLen) ? 1 : 0;
-      const movesLen = entTokens.length;
-      const spec = specificityScore(rawName);
-
-      // key order: samePly, reachesCanon, commonLen, entryFullyMatchedByPlay, movesLen, spec
-      const key = [samePly, reachesCanon, commonLen, entryFullyMatchedByPlay, movesLen, spec];
-      scored.push({ key, ent, entPly, rawName });
-      debugCands.push({ raw: rawName, ply: entPly, ent_len: movesLen, common_len: commonLen, same_ply: samePly });
-    }
-
-    if (debug && debugCands.length > 0) {
-      bestOut = bestOut || {};
-      bestOut.debug_candidates_by_ply = bestOut.debug_candidates_by_ply || [];
-      bestOut.debug_candidates_by_ply.push({ ply, fen: canon, candidates: debugCands });
-    }
-
-    if (!scored || scored.length === 0) continue;
-
-    // choose best by key (descending lexicographic)
-    scored.sort((a, b) => {
-      const A = a.key, B = b.key;
-      for (let i = 0; i < Math.max(A.length, B.length); i++) {
-        const av = A[i] || 0, bv = B[i] || 0;
-        if (av !== bv) return bv - av; // descending
-      }
-      return 0;
+    // compute scored list via bestEntryForFen but we want to consider orderless options
+    const entryChoice = bestEntryForFen(canon, playedTokensAtPly, wholeGameTokens, {
+      preferSetMatch: !!opts.prefer_set_matches,
+      setThreshold: (typeof opts.orderless_threshold === 'number') ? opts.orderless_threshold : 1.0
     });
 
-    const chosen = scored[0].ent;
-    const chosenRaw = scored[0].rawName;
+    if (!entryChoice || !entryChoice.ent) continue;
+
+    const chosen = entryChoice.ent;
+    const chosenRaw = entryChoice.rawName;
     const ecoCode = chosen.eco;
-    const openingPath = buildOpeningPathFromRaw(chosenRaw, tokens[0] || null);
+    const matchedPly = entryChoice.entPly || ply;
+
+    // Build hierarchical opening info by walking up from matchedPly -> 1 and picking best match at each ply
+    const pathList = [];
+    const seen = new Set();
+    const per_level = [];
+
+    for (let p = matchedPly; p >= 1; p--) {
+      const rec = fenPerPly[p - 1];
+      if (!rec || !rec.fen) continue;
+      const canonAtPly = rec.fen;
+      const tokensAtPly = rec.played_tokens || [];
+      const best = bestEntryForFen(canonAtPly, tokensAtPly, wholeGameTokens, {
+        preferSetMatch: !!opts.prefer_set_matches,
+        setThreshold: (typeof opts.orderless_threshold === 'number') ? opts.orderless_threshold : 1.0
+      });
+
+      const level = { ply: p, fen: canonAtPly, chosen: null, chosen_raw: null, eco: null, moves_leading: tokensAtPly.slice(), matched_by_set: false, matched_tokens: [], matched_tokens_positions: [] };
+
+      if (best && best.ent) {
+        const ent = best.ent;
+        const entTokens = best.entTokens || movesTokensFromNorm(ent._moves_norm || '');
+        level.chosen = { _key: ent._key, name: ent.name || ent.opening || ent._key, eco: ent.eco || null };
+        level.chosen_raw = best.rawName;
+        level.eco = ent.eco || null;
+
+        // which moves (ordered) led to this match
+        level.moves_leading = movesForPly(fenPerPly, p);
+
+        // orderless matching metadata vs whole game
+        const containsAll = entryMatchesBySetFraction(entTokens, wholeGameTokens, (typeof opts.orderless_threshold === 'number' ? opts.orderless_threshold : 1.0));
+        level.matched_by_set = containsAll;
+        level.matched_tokens = entTokens.slice(0, Math.min(entTokens.length, 64));
+        level.matched_tokens_positions = findMatchedTokensPositions(entTokens, wholeGameTokens);
+
+        if (best.rawName && !seen.has(best.rawName)) { pathList.push(best.rawName); seen.add(best.rawName); }
+      } else {
+        const altRefs = FEN_TO_ENTRIES.get(canonAtPly) || [];
+        if (altRefs.length > 0) {
+          const alt = altRefs[0].ent;
+          const altName = ((alt.name || alt.opening || alt._key) || '').toString().trim();
+          level.chosen = { _key: alt._key, name: alt.name || alt.opening || alt._key, eco: alt.eco || null };
+          level.chosen_raw = altName;
+          level.eco = alt.eco || null;
+          level.moves_leading = movesForPly(fenPerPly, p);
+          if (altName && !seen.has(altName)) { pathList.push(altName); seen.add(altName); }
+        }
+      }
+
+      per_level.push(level);
+    }
+
+    // Flatten the collected raw names into a human-friendly opening_path using your existing function
+    let openingPath;
+    if (pathList.length > 0) {
+      const flat = [];
+      for (const raw of pathList) {
+        const frag = buildOpeningPathFromRaw(raw, tokens[0] || null);
+        for (const pName of frag) if (!flat.includes(pName)) flat.push(pName);
+      }
+      openingPath = flat;
+    } else {
+      openingPath = buildOpeningPathFromRaw(chosenRaw, tokens[0] || null);
+    }
+
     const out = {
       opening_path: openingPath,
       opening: { eco: ecoCode, name: openingPath[0] || null },
-      book_moves: chosen._moves_norm || [],
+      book_moves: chosen._moves_norm || chosen.moves || [],
       matched_fen: canon,
-      plies_analyzed: ply,
+      plies_analyzed: matchedPly,
       max_plies: max_plies,
+      per_level: per_level
     };
+
     if (debug) {
       out.debug = out.debug || {};
       out.debug.fen_per_ply = fenPerPly;
-      out.debug.scored_top_key = scored[0].key;
-      out.debug.candidates_count_at_ply = scored.length;
-      if (bestOut && bestOut.debug_candidates_by_ply) out.debug.debug_candidates_by_ply = bestOut.debug_candidates_by_ply;
+      out.debug.chosen_key = entryChoice.key;
     }
     return out;
   }
@@ -542,9 +632,9 @@ function analyzeByFen(pgnText, maxPlies, requireFenOnly = false, debug = false) 
   seq.matched_fen = null;
   if (debug) seq.debug = { fen_per_ply: fenPerPly };
 
-  // ---------- London detection heuristic (applied on fallback sequence result) ----------
+  // London detection heuristic (applied on fallback sequence result)
   function detectLondonFromTokens(tokensList, lookaheadPlies = 16) {
-    const bf4Re = /^([Bb].{0,2}f4|Bf4)\b/i; // sloppy
+    const bf4Re = /^([Bb].{0,2}f4|Bf4)\b/i;
     const c4Re = /^(c4|cxd4|cxd5)\b/i;
     const e3Re = /^e3\b/i;
     const c3Re = /^c3\b/i;
@@ -632,19 +722,16 @@ async function postResultToServer(callbackUrl, payload, timeout) {
 function createApp() {
   const app = express();
   app.use(express.json({ limit: '1mb' }));
-
-  app.use(cors());          // allow all origins (dev). Replace with options to restrict if you want.
-app.options('*', cors()); // respond to preflight
+  app.use(cors());
+  app.options('*', cors());
 
   app.get('/health', (req, res) => res.json({ ok: true }));
 
   app.get('/debug_openings', (req, res) => {
     const sample = [];
-    let count = 0;
     for (const [fen, arr] of Array.from(FEN_TO_ENTRIES.entries()).slice(0, 12)) {
       const entry = arr[0].ent;
       sample.push({ fen, name: entry.name, eco: entry.eco, _key: entry._key });
-      count++;
     }
     res.json({ count: OPENINGS.length, fen_index_size: FEN_TO_ENTRIES.size, sample });
   });
@@ -657,10 +744,17 @@ app.options('*', cors()); // respond to preflight
     const requireFenOnly = !!data.require_fen_only;
     const debug = !!data.debug;
 
+    // new options
+    const orderless_matching = !!data.orderless_matching;
+    const orderless_threshold = (typeof data.orderless_threshold === 'number') ? Math.max(0, Math.min(1, data.orderless_threshold)) : 1.0;
+    const prefer_set_matches = !!data.prefer_set_matches;
+
     if (!pgn || typeof pgn !== 'string' || !pgn.trim()) return res.status(400).json({ error: 'No PGN provided (send JSON: {"pgn":"1. e4 e5 ..."})' });
 
     try {
-      const out = analyzeByFen(pgn.trim(), maxPlies, requireFenOnly, debug);
+      const out = analyzeByFen(pgn.trim(), maxPlies, requireFenOnly, debug, { orderless_matching, orderless_threshold, prefer_set_matches });
+      // annotate with options used
+      out._options = { orderless_matching, orderless_threshold, prefer_set_matches };
       if (callback) {
         const postInfo = await postResultToServer(callback, out);
         out._post_result = postInfo;
@@ -735,8 +829,11 @@ async function main(argv) {
       const callback = inputData.callback_url || inputData.callback || DEFAULT_CALLBACK_URL;
       const require_fen_only = !!inputData.require_fen_only;
       const debug = !!inputData.debug;
+      const orderless_matching = !!inputData.orderless_matching;
+      const orderless_threshold = (typeof inputData.orderless_threshold === 'number') ? Math.max(0, Math.min(1, inputData.orderless_threshold)) : 1.0;
+      const prefer_set_matches = !!inputData.prefer_set_matches;
       if (!pgn) { logError("INPUT provided but no 'pgn' field"); process.exit(1); }
-      const out = analyzeByFen(pgn, max_plies, require_fen_only, debug);
+      const out = analyzeByFen(pgn, max_plies, require_fen_only, debug, { orderless_matching, orderless_threshold, prefer_set_matches });
       if (callback) {
         const postInfo = await postResultToServer(callback, out);
         out._post_result = postInfo;
@@ -760,7 +857,6 @@ async function main(argv) {
   if (args.poll) {
     if (!POLL_URL) { logError('POLL_URL not set; cannot start poll mode'); process.exit(2); }
     const stopSignal = { stopped: false };
-    const _sig = require('signals') || null; // optional
     process.on('SIGINT', () => { logInfo('Received SIGINT: stopping poll loop'); stopSignal.stopped = true; });
     process.on('SIGTERM', () => { logInfo('Received SIGTERM: stopping poll loop'); stopSignal.stopped = true; });
     try {
