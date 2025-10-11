@@ -1,15 +1,8 @@
 #!/usr/bin/env node
 /*
   eco_fen_bot.js - rewritten with "walk-up" hierarchical path and orderless matching,
-  plus per-ply progressive opening summary.
-
-  Usage / notes: same as original. New POST /analyze options:
-    - orderless_matching: boolean (default false)
-    - orderless_threshold: number between 0 and 1 (default 1.0)
-    - prefer_set_matches: boolean (default false)
-
-  Dependencies: express, axios, chess.js, cors, minimist
-  Install: npm i express axios chess.js cors minimist
+  plus per-ply progressive opening summary. Now builds parent->...->specific opening_path
+  that follows the PGN moves.
 */
 
 const fs = require('fs');
@@ -64,7 +57,6 @@ function normalizeMoveNumbersLine(s) {
 }
 
 // Robust PGN moves tokenizer: strips tag-pair header lines and then extracts moves.
-// This fixes PGNs without blank line after headers.
 function tokenizePgnMoves(pgnText) {
   let text = pgnText || '';
   if (!text) return [];
@@ -256,6 +248,7 @@ function loadOpeningsFromEco(filename) {
   const openings = [];
   const fenIndex = new Map(); // Map<canonFen, Array<{ent, ply}>>
 
+
   function addToIndex(canon, ent, ply) {
     if (!canon) return;
     const arr = fenIndex.get(canon) || [];
@@ -388,12 +381,13 @@ function bestEntryForFen(canon, playedTokensAtPly, fullPlayedTokens, options = {
     const setThreshold = (options && typeof options.setThreshold === 'number') ? options.setThreshold : 1.0;
     const setMatched = entryMatchesBySetFraction(entTokens, fullPlayedTokens || [], setThreshold) ? 1 : 0;
 
-    // build scoring key; if preferSetMatch, weight setMatched higher
+    // build scoring key; prefer longer common prefix earlier to favor human-expected path
     let key;
     if (options && options.preferSetMatch) {
-      key = [setMatched, samePly, reachesCanon, commonLen, entryFullyMatchedByPlay, -movesLen, spec];
+      key = [setMatched, samePly, commonLen, entryFullyMatchedByPlay, reachesCanon, -movesLen, spec];
     } else {
-      key = [samePly, reachesCanon, commonLen, entryFullyMatchedByPlay, -movesLen, spec, setMatched];
+      // NOTE: commonLen moved earlier vs your original; this biases toward entries that share longer prefix
+      key = [samePly, commonLen, entryFullyMatchedByPlay, reachesCanon, -movesLen, spec, setMatched];
     }
 
     scored.push({ key, ent, entPly, rawName, entTokens, setMatched });
@@ -418,7 +412,6 @@ function bestEntryForFen(canon, playedTokensAtPly, fullPlayedTokens, options = {
 // Sequence fallback helper (for per-ply sequence-only matching)
 // -------------------------
 function bestSequenceMatchForTokens(seqTokens) {
-  // seqTokens: array like ['e4'] or ['e4','e5','Nf3', ...]
   if (!Array.isArray(seqTokens) || seqTokens.length === 0) return null;
 
   const candidates = [];
@@ -437,7 +430,6 @@ function bestSequenceMatchForTokens(seqTokens) {
 
   if (candidates.length === 0) return null;
 
-  // pick best raw as in analyzeBySequence (specificity + count)
   const rawCounts = new Map();
   const rawToEntries = new Map();
   for (const ent of candidates) {
@@ -523,11 +515,98 @@ function analyzeBySequence(pgnText, maxPlies) {
   const ecoCode = exampleEnt.eco;
   return {
     opening_path: openingPath,
-    opening: { eco: ecoCode, name: openingPath[0] || null },
+    opening: { eco: ecoCode, name: openingPath[openingPath.length - 1] || openingPath[0] || null },
     book_moves: exampleEnt._moves_norm || [],
     plies_analyzed: pliesDone,
     max_plies: max_plies,
   };
+}
+
+// -------------------------
+// New helper: build parent chain (general -> specific) following PGN
+// -------------------------
+function buildParentChainFromFenPerPly(fenPerPly, matchedPly, firstToken, wholeGameTokens) {
+  // returns array of parent names (most general -> more specific) for plies 1..matchedPly
+  const parentChain = [];
+  const seen = new Set();
+
+  for (let p = 1; p <= matchedPly; p++) {
+    const rec = fenPerPly[p - 1];
+    if (!rec) continue;
+    const seqTokensAtPly = rec.played_tokens || [];
+
+    // get candidates from FEN index first
+    let candidates = [];
+    const fenCandidates = FEN_TO_ENTRIES.get(rec.fen) || [];
+    if (fenCandidates && fenCandidates.length > 0) {
+      candidates = fenCandidates.map(r => r.ent).filter(Boolean);
+    } else {
+      // fallback: sequence-prefix candidates
+      for (const ent of OPENINGS) {
+        if (!ent._moves_norm) continue;
+        const entTokens = movesTokensFromNorm(ent._moves_norm || '');
+        if (!entTokens || entTokens.length < seqTokensAtPly.length) continue;
+        let ok = true;
+        for (let i = 0; i < seqTokensAtPly.length; i++) {
+          if (entTokens[i] !== seqTokensAtPly[i]) { ok = false; break; }
+        }
+        if (ok) candidates.push(ent);
+      }
+    }
+
+    if (!candidates || candidates.length === 0) {
+      // if no candidates, consider POPULAR_FIRST_MOVES for first ply
+      if (p === 1 && firstToken) {
+        const list = POPULAR_FIRST_MOVES[firstToken.toLowerCase()] || [];
+        if (list.length > 0) {
+          const parent = list[0];
+          if (!seen.has(parent)) { parentChain.push(parent); seen.add(parent); }
+        }
+      }
+      continue;
+    }
+
+    // derive "parent name" per candidate by using buildOpeningPathFromRaw and taking the most general fragment (last)
+    const parentCounts = new Map();
+    const parentSpecs = new Map();
+    for (const ent of candidates) {
+      const raw = (ent.name || ent.opening || ent._key || '').toString().trim();
+      const path = buildOpeningPathFromRaw(raw, firstToken);
+      let parent = null;
+      if (path && path.length > 0) {
+        parent = path[path.length - 1]; // most general fragment returned by buildOpeningPathFromRaw
+      } else {
+        parent = raw || null;
+      }
+      if (!parent) continue;
+      parentCounts.set(parent, (parentCounts.get(parent) || 0) + 1);
+      parentSpecs.set(parent, Math.min(parentSpecs.get(parent) || Infinity, specificityScore(parent) || 0));
+    }
+
+    if (parentCounts.size === 0) continue;
+
+    // choose the parent with highest frequency; tie-breaker = lower specificityScore (more general)
+    let bestParent = null;
+    for (const [par, cnt] of parentCounts.entries()) {
+      if (!bestParent) bestParent = par;
+      else {
+        const bestCnt = parentCounts.get(bestParent) || 0;
+        if (cnt > bestCnt) bestParent = par;
+        else if (cnt === bestCnt) {
+          const aSpec = parentSpecs.get(bestParent) || 0;
+          const bSpec = parentSpecs.get(par) || 0;
+          if (bSpec < aSpec) bestParent = par;
+        }
+      }
+    }
+
+    if (bestParent && !seen.has(bestParent)) {
+      parentChain.push(bestParent);
+      seen.add(bestParent);
+    }
+  }
+
+  return parentChain;
 }
 
 // -------------------------
@@ -658,126 +737,126 @@ function analyzeByFen(pgnText, maxPlies, requireFenOnly = false, debug = false, 
     ply_progression.push(human);
   }
 
-  // search from deepest ply -> shallowest for the primary "matched opening" using your walk-up logic
-  let bestOut = null;
+  // First: find the best specific entry by scanning deepest -> shallowest (existing logic)
+  let bestTopLevelChoice = null;
   for (let ri = fenPerPly.length - 1; ri >= 0; ri--) {
     const record = fenPerPly[ri];
-    const ply = record.ply;
-    const canon = record.fen;
     const playedTokensAtPly = record.played_tokens;
-    const playedLen = playedTokensAtPly.length;
+    const entryChoice = bestEntryForFen(record.fen, playedTokensAtPly, wholeGameTokens, {
+      preferSetMatch: !!opts.prefer_set_matches,
+      setThreshold: (typeof opts.orderless_threshold === 'number') ? opts.orderless_threshold : 1.0
+    });
+    if (!entryChoice || !entryChoice.ent) continue;
+    bestTopLevelChoice = { record, entryChoice };
+    break;
+  }
 
-    const candRefs = FEN_TO_ENTRIES.get(canon) || [];
-    if (!candRefs || candRefs.length === 0) continue;
+  if (!bestTopLevelChoice) {
+    // No FEN-based top-level match found: fallback to sequence analyzer but include per-ply progression
+    if (requireFenOnly) {
+      const out = { opening_path: [], opening: null, book_moves: [], matched_fen: null, plies_analyzed: pliesDone, max_plies: max_plies, error: 'no_fen_match', per_ply: per_ply, ply_progression: ply_progression };
+      if (debug) out.debug = { fen_per_ply: fenPerPly };
+      return out;
+    } else {
+      const seq = analyzeBySequence(pgnText, max_plies);
+      seq.matched_fen = null;
+      seq.per_ply = per_ply;
+      seq.ply_progression = ply_progression;
+      if (debug) seq.debug = { fen_per_ply: fenPerPly };
+      return seq;
+    }
+  }
 
-    const entryChoice = bestEntryForFen(canon, playedTokensAtPly, wholeGameTokens, {
+  // We have a top-level specific entry
+  const chosen = bestTopLevelChoice.entryChoice.ent;
+  const chosenRaw = bestTopLevelChoice.entryChoice.rawName;
+  const ecoCode = chosen.eco;
+  const matchedPly = bestTopLevelChoice.entryChoice.entPly || bestTopLevelChoice.record.ply;
+
+  // Build parent chain (general -> specific) from ply 1 -> matchedPly
+  const parentChain = buildParentChainFromFenPerPly(fenPerPly, matchedPly, tokens[0] || null, wholeGameTokens);
+
+  // Now add final specific opening fragments (most specific last)
+  const chosenFragments = buildOpeningPathFromRaw(chosenRaw, tokens[0] || null) || [];
+  // chosenFragments usually returns [specific, ..., general]. We want general->...->specific
+  const chosenFragmentsGeneralToSpecific = chosenFragments.slice().reverse();
+
+  // Merge parentChain and chosenFragmentsGeneralToSpecific, preserving order and removing duplicates
+  const finalPath = [];
+  const seenFinal = new Set();
+  for (const p of parentChain) {
+    if (p && !seenFinal.has(p)) { finalPath.push(p); seenFinal.add(p); }
+  }
+  for (const p of chosenFragmentsGeneralToSpecific) {
+    if (p && !seenFinal.has(p)) { finalPath.push(p); seenFinal.add(p); }
+  }
+
+  // If finalPath is empty, fallback to buildOpeningPathFromRaw(chosenRaw) as before (reversed to general->spec)
+  if (finalPath.length === 0 && chosenFragments && chosenFragments.length > 0) {
+    const fallback = chosenFragments.slice().reverse();
+    for (const p of fallback) if (!seenFinal.has(p)) { finalPath.push(p); seenFinal.add(p); }
+  }
+
+  // Make sure most specific is last (opening.name)
+  const mostSpecific = finalPath.length ? finalPath[finalPath.length - 1] : (chosenFragments[0] || chosen.name || null);
+
+  // top-level output
+  const out = {
+    opening_path: finalPath,
+    opening: { eco: ecoCode || null, name: mostSpecific || null },
+    book_moves: chosen._moves_norm || chosen.moves || [],
+    matched_fen: bestTopLevelChoice.record.fen,
+    plies_analyzed: matchedPly,
+    max_plies: max_plies,
+    per_level: [], // legacy per_level info can be re-created if desired
+    per_ply: per_ply,
+    ply_progression: ply_progression
+  };
+
+  // Optionally populate per_level similar to previous behavior (walk-up matches)
+  // We'll keep it similar to the original per_level so it remains useful for debugging
+  const per_level = [];
+  const seenLevels = new Set();
+  for (let p = matchedPly; p >= 1; p--) {
+    const rec = fenPerPly[p - 1];
+    if (!rec) continue;
+    const best = bestEntryForFen(rec.fen, rec.played_tokens || [], wholeGameTokens, {
       preferSetMatch: !!opts.prefer_set_matches,
       setThreshold: (typeof opts.orderless_threshold === 'number') ? opts.orderless_threshold : 1.0
     });
 
-    if (!entryChoice || !entryChoice.ent) continue;
-
-    const chosen = entryChoice.ent;
-    const chosenRaw = entryChoice.rawName;
-    const ecoCode = chosen.eco;
-    const matchedPly = entryChoice.entPly || ply;
-
-    // Build hierarchical opening info by walking up from matchedPly -> 1 and picking best match at each ply
-    const pathList = [];
-    const seen = new Set();
-    const per_level = [];
-
-    for (let p = matchedPly; p >= 1; p--) {
-      const rec = fenPerPly[p - 1];
-      if (!rec || !rec.fen) continue;
-      const canonAtPly = rec.fen;
-      const tokensAtPly = rec.played_tokens || [];
-      const best = bestEntryForFen(canonAtPly, tokensAtPly, wholeGameTokens, {
-        preferSetMatch: !!opts.prefer_set_matches,
-        setThreshold: (typeof opts.orderless_threshold === 'number') ? opts.orderless_threshold : 1.0
-      });
-
-      const level = { ply: p, fen: canonAtPly, chosen: null, chosen_raw: null, eco: null, moves_leading: tokensAtPly.slice(), matched_by_set: false, matched_tokens: [], matched_tokens_positions: [] };
-
-      if (best && best.ent) {
-        const ent = best.ent;
-        const entTokens = best.entTokens || movesTokensFromNorm(ent._moves_norm || '');
-        level.chosen = { _key: ent._key, name: ent.name || ent.opening || ent._key, eco: ent.eco || null };
-        level.chosen_raw = best.rawName;
-        level.eco = ent.eco || null;
-
-        // which moves (ordered) led to this match
-        level.moves_leading = movesForPly(fenPerPly, p);
-
-        // orderless matching metadata vs whole game
-        const containsAll = entryMatchesBySetFraction(entTokens, wholeGameTokens, (typeof opts.orderless_threshold === 'number' ? opts.orderless_threshold : 1.0));
-        level.matched_by_set = containsAll;
-        level.matched_tokens = entTokens.slice(0, Math.min(entTokens.length, 64));
-        level.matched_tokens_positions = findMatchedTokensPositions(entTokens, wholeGameTokens);
-
-        if (best.rawName && !seen.has(best.rawName)) { pathList.push(best.rawName); seen.add(best.rawName); }
-      } else {
-        const altRefs = FEN_TO_ENTRIES.get(canonAtPly) || [];
-        if (altRefs.length > 0) {
-          const alt = altRefs[0].ent;
-          const altName = ((alt.name || alt.opening || alt._key) || '').toString().trim();
-          level.chosen = { _key: alt._key, name: alt.name || alt.opening || alt._key, eco: alt.eco || null };
-          level.chosen_raw = altName;
-          level.eco = alt.eco || null;
-          level.moves_leading = movesForPly(fenPerPly, p);
-          if (altName && !seen.has(altName)) { pathList.push(altName); seen.add(altName); }
-        }
-      }
-
-      per_level.push(level);
-    }
-
-    // Flatten the collected raw names into a human-friendly opening_path using your existing function
-    let openingPath;
-    if (pathList.length > 0) {
-      const flat = [];
-      for (const raw of pathList) {
-        const frag = buildOpeningPathFromRaw(raw, tokens[0] || null);
-        for (const pName of frag) if (!flat.includes(pName)) flat.push(pName);
-      }
-      openingPath = flat;
+    const level = { ply: p, fen: rec.fen, chosen: null, chosen_raw: null, eco: null, moves_leading: (rec.played_tokens || []).slice(), matched_by_set: false, matched_tokens: [], matched_tokens_positions: [] };
+    if (best && best.ent) {
+      const ent = best.ent;
+      const entTokens = best.entTokens || movesTokensFromNorm(ent._moves_norm || '');
+      level.chosen = { _key: ent._key, name: ent.name || ent.opening || ent._key, eco: ent.eco || null };
+      level.chosen_raw = best.rawName;
+      level.eco = ent.eco || null;
+      level.matched_by_set = entryMatchesBySetFraction(entTokens, wholeGameTokens, (typeof opts.orderless_threshold === 'number' ? opts.orderless_threshold : 1.0));
+      level.matched_tokens = entTokens.slice(0, Math.min(entTokens.length, 64));
+      level.matched_tokens_positions = findMatchedTokensPositions(entTokens, wholeGameTokens);
+      if (best.rawName && !seenLevels.has(best.rawName)) { per_level.push(level); seenLevels.add(best.rawName); }
     } else {
-      openingPath = buildOpeningPathFromRaw(chosenRaw, tokens[0] || null);
+      const altRefs = FEN_TO_ENTRIES.get(rec.fen) || [];
+      if (altRefs.length > 0) {
+        const alt = altRefs[0].ent;
+        const altName = ((alt.name || alt.opening || alt._key) || '').toString().trim();
+        level.chosen = { _key: alt._key, name: alt.name || alt.opening || alt._key, eco: alt.eco || null };
+        level.chosen_raw = altName;
+        level.eco = alt.eco || null;
+        level.moves_leading = movesForPly(fenPerPly, p);
+        if (altName && !seenLevels.has(altName)) { per_level.push(level); seenLevels.add(altName); }
+      }
     }
+  }
+  out.per_level = per_level;
 
-    const out = {
-      opening_path: openingPath,
-      opening: { eco: ecoCode, name: openingPath[0] || null },
-      book_moves: chosen._moves_norm || chosen.moves || [],
-      matched_fen: canon,
-      plies_analyzed: matchedPly,
-      max_plies: max_plies,
-      per_level: per_level,
-      per_ply: per_ply,
-      ply_progression: ply_progression
-    };
-
-    if (debug) {
-      out.debug = out.debug || {};
-      out.debug.fen_per_ply = fenPerPly;
-      out.debug.chosen_key = entryChoice.key;
-    }
-    return out;
+  if (debug) {
+    out.debug = out.debug || {};
+    out.debug.fen_per_ply = fenPerPly;
   }
 
-  // No FEN-based top-level match found: fallback to sequence analyzer but keep per-ply progression
-  if (requireFenOnly) {
-    const out = { opening_path: [], opening: null, book_moves: [], matched_fen: null, plies_analyzed: pliesDone, max_plies: max_plies, error: 'no_fen_match', per_ply: per_ply, ply_progression: ply_progression };
-    if (debug) out.debug = { fen_per_ply: fenPerPly };
-    return out;
-  }
-
-  const seq = analyzeBySequence(pgnText, max_plies);
-  seq.matched_fen = null;
-  seq.per_ply = per_ply;
-  seq.ply_progression = ply_progression;
-  if (debug) seq.debug = { fen_per_ply: fenPerPly };
-  return seq;
+  return out;
 }
 
 // -------------------------
